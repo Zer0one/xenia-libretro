@@ -71,7 +71,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.sha }}
         run: |
           python3 .ci-tools/.ci/package-release.py build \
-            --core build-arm64/bin/macOS/Release/xenia_edge_libretro.dylib \
+            --core "$(find build* -type f -path '*/bin/macOS/Release/xenia_edge_libretro.dylib')" \
             --tag "$RELEASE_TAG" --output dist
       - uses: actions/upload-artifact@v4
         with:
