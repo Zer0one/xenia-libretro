@@ -4,6 +4,8 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## Unreleased
 
+- Verify and publish the complete six-target `v0.1.0.1` release through GitHub Actions, including both Android targets and matching Windows crash symbols. All eight downloaded assets pass checksum/source/provenance checks; the local macOS installation matches its CI archive. Other-platform frontend and gameplay acceptance remains pending.
+
 - Build and publish all six configured release targets through the shared remote build workflow: Windows x86_64, Linux x86_64/ARM64, macOS ARM64 and Android ARM64/x86_64. Require matching Windows symbols and the complete desktop set; Android remains non-blocking until further user instruction, so failed Android builds can be omitted while the verified desktop set is published.
 
 - Pin the remote macOS release toolchain to Xcode 26.3 and check C++20 `jthread`/`stop_token` before building. The runner's Xcode 16.4 default cannot compile the integrated upstream networking code; the tagged core source is unchanged.
