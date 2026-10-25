@@ -21,13 +21,17 @@ on:
         default: ''
       allow_android_failure:
         type: boolean
-        default: false
+        default: true
   workflow_dispatch:
     inputs:
       platforms:
         description: 'Platforms to build, comma-separated (linux, windows, android, macos), or all'
         type: string
         default: all
+      allow_android_failure:
+        description: 'Android is non-blocking until further instruction; false makes it mandatory'
+        type: boolean
+        default: true
   push:
     branches: [main]
     paths-ignore:
@@ -348,7 +352,7 @@ jobs:
   # Cross-compiled with the NDK; the shader compiler the build runs is built
   # for the host first
   android:
-    continue-on-error: ${{ inputs.allow_android_failure || false }}
+    continue-on-error: ${{ github.event_name == 'push' || inputs.allow_android_failure }}
     if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'android')
     name: Android ${{ matrix.abi }}
     timeout-minutes: 90
