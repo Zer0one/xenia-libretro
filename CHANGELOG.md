@@ -4,6 +4,8 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## Unreleased
 
+- Build and publish all six configured release targets through the shared remote build workflow: Windows x86_64, Linux x86_64/ARM64, macOS ARM64 and Android ARM64/x86_64. Require matching Windows symbols and the complete desktop set; an explicit per-run authorization may omit Android after an Android failure.
+
 - Pin the remote macOS release toolchain to Xcode 26.3 and check C++20 `jthread`/`stop_token` before building. The runner's Xcode 16.4 default cannot compile the integrated upstream networking code; the tagged core source is unchanged.
 - Build, verify, package and publish rolling releases entirely on GitHub Actions. A manual release can rebuild an existing immutable tag with separately pinned current CI tooling; package manifests record both source and workflow revisions. Local installation uses the downloaded CI artifact.
 

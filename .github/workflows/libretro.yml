@@ -5,6 +5,23 @@ name: Build libretro core
 # Edge with.
 
 on:
+  workflow_call:
+    inputs:
+      platforms:
+        type: string
+        default: all
+      source_ref:
+        type: string
+        default: ''
+      workflow_ref:
+        type: string
+        default: ''
+      release_tag:
+        type: string
+        default: ''
+      allow_android_failure:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       platforms:
@@ -17,6 +34,13 @@ on:
       - '*.md'
       - 'LICENSE'
 
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  WORKFLOW_COMMIT: ${{ inputs.workflow_ref || github.sha }}
+
 # Test builds can be limited to the platforms their testers use: the
 # platforms input (workflow_dispatch) lists them. Pushes and "all" build
 # everything.
@@ -24,6 +48,7 @@ jobs:
   linux:
     if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'linux')
     name: Linux ${{ matrix.arch }}
+    timeout-minutes: 90
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -36,7 +61,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Check Out Current Release Tools
+        if: inputs.release_tag != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.workflow_ref || github.sha }}
+          path: .ci-tools
+          sparse-checkout: .ci/package-release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Release Source
+        if: inputs.release_tag != ''
+        shell: python
+        run: |
+          import os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag), tag
+          git = lambda *a: subprocess.check_output(['git', *a], text=True).strip()
+          assert git('rev-parse', 'HEAD') == git('rev-parse', tag + '^{commit}')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
 
       # As upstream: clang 21 from apt.llvm.org with GCC 14's libstdc++, on
       # Ubuntu 22.04 for an older glibc
@@ -58,7 +107,7 @@ jobs:
         env:
           CC: clang-21
           CXX: clang++-21
-        run: ./xenia-build.py build --config=Release --target=xenia-libretro -- -- -k 0
+        run: ./xenia-build.py build --config=Release --target=xenia-libretro -- -- -j3
 
       - name: Collect
         run: |
@@ -76,14 +125,53 @@ jobs:
           name: xenia_edge_libretro-linux-${{ matrix.arch }}
           path: dist/
 
+      - name: Package Verified Release Target
+        if: inputs.release_tag != ''
+        shell: bash
+        run: |
+          python .ci-tools/.ci/package-release.py build --core dist/xenia_edge_libretro.so \
+            --tag "$RELEASE_TAG" --target linux-${{ matrix.arch }} --output packages
+      - uses: actions/upload-artifact@v4
+        if: inputs.release_tag != ''
+        with:
+          name: rolling-release-linux-${{ matrix.arch }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14
+
   windows:
     if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'windows')
     name: Windows x86_64
+    timeout-minutes: 90
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Check Out Current Release Tools
+        if: inputs.release_tag != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.workflow_ref || github.sha }}
+          path: .ci-tools
+          sparse-checkout: .ci/package-release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Release Source
+        if: inputs.release_tag != ''
+        shell: python
+        run: |
+          import os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag), tag
+          git = lambda *a: subprocess.check_output(['git', *a], text=True).strip()
+          assert git('rev-parse', 'HEAD') == git('rev-parse', tag + '^{commit}')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
 
       # Mesa's spirv_to_dxil, D3D12's shader backend, is built by meson
       - name: Setup
@@ -102,11 +190,17 @@ jobs:
         run: |
           curl -sSL -o dxc.zip https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip
           mkdir -p dxc
-          python -c "import zipfile; open('dxc/dxil.dll','wb').write(zipfile.ZipFile('dxc.zip').read('bin/x64/dxil.dll'))"
+          python - <<'PYCODE'
+          import zipfile
+          with zipfile.ZipFile('dxc.zip') as z:
+              names = [n for n in z.namelist() if n.replace('\\', '/') == 'bin/x64/dxil.dll']
+              assert len(names) == 1, names
+              open('dxc/dxil.dll', 'wb').write(z.read(names[0]))
+          PYCODE
           echo "XENIA_LIBRETRO_DXIL=$GITHUB_WORKSPACE/dxc/dxil.dll" >> $GITHUB_ENV
 
       - name: Build
-        run: python xenia-build.py build --config=Release --target=xenia-libretro -- -- -k 0
+        run: python xenia-build.py build --config=Release --target=xenia-libretro -- -- -j3
 
       - name: Collect
         shell: bash
@@ -134,14 +228,31 @@ jobs:
           path: symbols/
           if-no-files-found: ignore
 
+      - name: Package Verified Release Target
+        if: inputs.release_tag != ''
+        shell: bash
+        run: |
+          python .ci-tools/.ci/package-release.py build --core dist/xenia_edge_libretro.dll \
+            --tag "$RELEASE_TAG" --target windows-x86_64 --output packages --symbols "$(find symbols -name xenia_edge_libretro.pdb -type f)"
+      - uses: actions/upload-artifact@v4
+        if: inputs.release_tag != ''
+        with:
+          name: rolling-release-windows-x86_64
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14
+
   # Vulkan through MoltenVK, linked into the core as upstream links it into
-  # the app; the core runs Xenia's own Vulkan device and hands RetroArch the
-  # frames. Apple Silicon only: the x64 backend needs the address space
+  # the app; the core negotiates a shared Vulkan device and hands GPU images
+  # to RetroArch. Apple Silicon only: the x64 backend needs the address space
   # below 4 GB, which a dylib can't free (the __PAGEZERO is RetroArch's)
   macos:
     if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'macos')
     name: macOS ${{ matrix.arch }}
+    timeout-minutes: 60
     runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     strategy:
       fail-fast: false
       matrix:
@@ -149,8 +260,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Check Out Current Release Tools
+        if: inputs.release_tag != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.workflow_ref || github.sha }}
+          path: .ci-tools
+          sparse-checkout: .ci/package-release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Release Source
+        if: inputs.release_tag != ''
+        shell: python
+        run: |
+          import os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag), tag
+          git = lambda *a: subprocess.check_output(['git', *a], text=True).strip()
+          assert git('rev-parse', 'HEAD') == git('rev-parse', tag + '^{commit}')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
 
+      - name: Verify Pinned C++ Toolchain
+        shell: bash
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          clang++ --version
+          cat > "$RUNNER_TEMP/jthread-probe.cc" <<'CPP'
+          #include <thread>
+          #include <stop_token>
+          int main() {
+            std::jthread worker([](std::stop_token) {});
+            worker.request_stop();
+            worker.join();
+          }
+          CPP
+          clang++ -std=c++20 -mmacosx-version-min=15.0 "$RUNNER_TEMP/jthread-probe.cc" -o "$RUNNER_TEMP/jthread-probe"
+          "$RUNNER_TEMP/jthread-probe"
       - name: Setup
         run: |
           brew install ninja
@@ -160,7 +312,7 @@ jobs:
           ./xenia-build.py fetchdata
 
       - name: Build
-        run: ./xenia-build.py build --config=Release --target=xenia-libretro --target-arch=${{ matrix.arch }} -- -- -k 0
+        run: ./xenia-build.py build --config=Release --target=xenia-libretro --target-arch=${{ matrix.arch }} -- -- -j3
 
       - name: Collect
         run: |
@@ -179,11 +331,27 @@ jobs:
           name: xenia_edge_libretro-macos-${{ matrix.arch }}
           path: dist/
 
+      - name: Package Verified Release Target
+        if: inputs.release_tag != ''
+        shell: bash
+        run: |
+          python .ci-tools/.ci/package-release.py build --core dist/xenia_edge_libretro.dylib \
+            --tag "$RELEASE_TAG" --target macos-arm64 --output packages
+      - uses: actions/upload-artifact@v4
+        if: inputs.release_tag != ''
+        with:
+          name: rolling-release-macos-arm64
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14
+
   # Cross-compiled with the NDK; the shader compiler the build runs is built
   # for the host first
   android:
+    continue-on-error: ${{ inputs.allow_android_failure || false }}
     if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'android')
     name: Android ${{ matrix.abi }}
+    timeout-minutes: 90
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -192,12 +360,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Check Out Current Release Tools
+        if: inputs.release_tag != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.workflow_ref || github.sha }}
+          path: .ci-tools
+          sparse-checkout: .ci/package-release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Release Source
+        if: inputs.release_tag != ''
+        shell: python
+        run: |
+          import os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag), tag
+          git = lambda *a: subprocess.check_output(['git', *a], text=True).strip()
+          assert git('rev-parse', 'HEAD') == git('rev-parse', tag + '^{commit}')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
 
       - name: Setup
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install ninja-build
+          sudo apt-get -y install ninja-build libfontconfig1-dev liblz4-dev
           pip install --upgrade cmake
           git submodule update --init --depth=1 -j$(getconf _NPROCESSORS_ONLN) $(grep -oP '(?<=path = )(?!third_party\/(mesa|MoltenVK|SPIRV-Cross|DirectX-Headers|DirectXShaderCompiler|libusb)).+' .gitmodules)
           ./xenia-build.py slang
@@ -206,7 +398,7 @@ jobs:
       - name: Host shader compiler
         run: |
           cmake -S . -B build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DXENIA_ENABLE_LTO=OFF
-          ninja -C build-host xenia-shader-cc
+          ninja -C build-host -j3 xenia-shader-cc
           echo "HOST_SHADER_CC=$(find $PWD/build-host -name xenia-shader-cc -type f | head -1)" >> $GITHUB_ENV
 
       - name: Build
@@ -218,7 +410,7 @@ jobs:
             -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
             -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
             -DXENIA_HOST_SHADER_CC=$HOST_SHADER_CC -DXENIA_ENABLE_LTO=OFF
-          ninja -C build-android -k 0 xenia-libretro
+          ninja -C build-android -j3 xenia-libretro
 
       - name: Collect
         run: |
@@ -235,3 +427,17 @@ jobs:
         with:
           name: xenia_edge_libretro-android-${{ matrix.abi }}
           path: dist/
+
+      - name: Package Verified Release Target
+        if: inputs.release_tag != ''
+        shell: bash
+        run: |
+          python .ci-tools/.ci/package-release.py build --core dist/xenia_edge_libretro_android.so \
+            --tag "$RELEASE_TAG" --target android-${{ matrix.abi }} --output packages
+      - uses: actions/upload-artifact@v4
+        if: inputs.release_tag != ''
+        with:
+          name: rolling-release-android-${{ matrix.abi }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14

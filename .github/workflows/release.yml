@@ -9,6 +9,10 @@ on:
         description: 'Existing four-component tag to build and publish'
         required: true
         type: string
+      allow_android_failure:
+        description: 'Permit this release to omit Android if either Android target fails'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,89 +23,25 @@ concurrency:
 
 env:
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+  WORKFLOW_COMMIT: ${{ github.sha }}
 
 jobs:
-  macos:
-    name: Build And Package macOS ARM64
-    runs-on: macos-15
-    timeout-minutes: 60
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_tag || github.ref }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check Out Release Tools From The Workflow Revision
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: .ci-tools
-          sparse-checkout: .ci/package-release.py
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Verify Pinned C++ Toolchain
-        shell: bash
-        run: |
-          xcodebuild -version
-          xcrun --sdk macosx --show-sdk-version
-          clang++ --version
-          cat > "$RUNNER_TEMP/jthread-probe.cc" <<'CPP'
-          #include <thread>
-          #include <stop_token>
-          int main() {
-            std::jthread worker([](std::stop_token) {});
-            worker.request_stop();
-            worker.join();
-          }
-          CPP
-          clang++ -std=c++20 -mmacosx-version-min=15.0 "$RUNNER_TEMP/jthread-probe.cc" -o "$RUNNER_TEMP/jthread-probe"
-          "$RUNNER_TEMP/jthread-probe"
-      - name: Validate Source Tag
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import os, re, subprocess
-          tag = os.environ['RELEASE_TAG']
-          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag), tag
-          git = lambda *args: subprocess.check_output(['git', *args], text=True).strip()
-          assert git('rev-parse', 'HEAD') == git('rev-parse', tag + '^{commit}')
-          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
-          print('Release source:', tag, git('rev-parse', 'HEAD'))
-          PY
-      - name: Set Up Build Dependencies
-        shell: bash
-        run: |
-          brew install ninja
-          git submodule update --init --depth=1 -j3 \
-            $(sed -n 's/^[[:space:]]*path = //p' .gitmodules | grep -vE 'mesa|DirectX-Headers|DirectXShaderCompiler|libusb')
-          ./xenia-build.py slang
-          ./xenia-build.py fetchdata
-      - name: Build Tagged Core
-        shell: bash
-        run: ./xenia-build.py build --config=Release --target=xenia-libretro --target-arch=arm64 -- -- -j3
-      - name: Verify And Package On The Runner
-        shell: bash
-        env:
-          WORKFLOW_COMMIT: ${{ github.sha }}
-        run: |
-          python3 .ci-tools/.ci/package-release.py build \
-            --core "$(find build* -type f -path '*/bin/macOS/Release/xenia_edge_libretro.dylib')" \
-            --tag "$RELEASE_TAG" --output dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rolling-release-macos-arm64
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 14
+  build:
+    name: Build All Six Targets
+    uses: ./.github/workflows/libretro.yml
+    with:
+      platforms: all
+      allow_android_failure: ${{ inputs.allow_android_failure || false }}
+      source_ref: ${{ inputs.release_tag || github.ref }}
+      workflow_ref: ${{ github.sha }}
+      release_tag: ${{ inputs.release_tag || github.ref_name }}
 
   publish:
     name: Verify And Publish Release
-    needs: macos
+    needs: build
+    # An explicitly permitted Android failure must not prevent desktop checks.
+    # The verifier still requires every desktop package and matching Windows PDB.
+    if: always() && !cancelled()
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -111,15 +51,21 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Test Publication Gates
+        run: python3 .ci/test_package_release.py
       - uses: actions/download-artifact@v4
         with:
-          name: rolling-release-macos-arm64
+          pattern: rolling-release-*
           path: dist
-      - name: Verify Downloaded Package And Tagged Source
+          merge-multiple: true
+      - name: Verify Complete Platform Set And Tagged Source
         shell: bash
+        env:
+          ALLOW_ANDROID_FAILURE: ${{ inputs.allow_android_failure || false }}
         run: |
           python3 .ci/package-release.py verify --tag "$RELEASE_TAG" --output dist \
-            --source-commit "$(git rev-parse "$RELEASE_TAG^{commit}")"
+            --source-commit "$(git rev-parse "$RELEASE_TAG^{commit}")" \
+            --publication-status "$RUNNER_TEMP/publication-status.json" --assemble-checksums
       - name: Publish CI Artifacts And Release Notes
         shell: bash
         env:
@@ -127,11 +73,21 @@ jobs:
         run: |
           notes="release-notes/${RELEASE_TAG#v}.md"
           test -f "$notes"
+          cp "$notes" "$RUNNER_TEMP/release-notes.md"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          status = json.loads((Path(os.environ['RUNNER_TEMP']) / 'publication-status.json').read_text())
+          with (Path(os.environ['RUNNER_TEMP']) / 'release-notes.md').open('a') as stream:
+              stream.write('\n### Published CI Targets\n\n' + ', '.join(status['published_targets']) + '.\n')
+              if status['android_omitted']:
+                  stream.write('\nAndroid was omitted from this release after a failed or incomplete Android build, under explicit user authorization. Desktop targets and Windows symbols passed their checks.\n')
+          PY
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* --clobber
             gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest \
-              --title "Xenia Edge Libretro ${RELEASE_TAG#v}" --notes-file "$notes"
+              --title "Xenia Edge Libretro ${RELEASE_TAG#v}" --notes-file "$RUNNER_TEMP/release-notes.md"
           else
             gh release create "$RELEASE_TAG" dist/* --verify-tag --latest \
-              --title "Xenia Edge Libretro ${RELEASE_TAG#v}" --notes-file "$notes"
+              --title "Xenia Edge Libretro ${RELEASE_TAG#v}" --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
