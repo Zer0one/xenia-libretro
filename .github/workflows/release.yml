@@ -1,0 +1,118 @@
+name: Publish rolling core release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing four-component tag to build and publish'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rolling-release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
+jobs:
+  macos:
+    name: Build And Package macOS ARM64
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check Out Release Tools From The Workflow Revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-tools
+          sparse-checkout: .ci/package-release.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Source Tag
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', tag), tag
+          git = lambda *args: subprocess.check_output(['git', *args], text=True).strip()
+          assert git('rev-parse', 'HEAD') == git('rev-parse', tag + '^{commit}')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
+          print('Release source:', tag, git('rev-parse', 'HEAD'))
+          PY
+      - name: Set Up Build Dependencies
+        shell: bash
+        run: |
+          brew install ninja
+          git submodule update --init --depth=1 -j3 \
+            $(sed -n 's/^[[:space:]]*path = //p' .gitmodules | grep -vE 'mesa|DirectX-Headers|DirectXShaderCompiler|libusb')
+          ./xenia-build.py slang
+          ./xenia-build.py fetchdata
+      - name: Build Tagged Core
+        shell: bash
+        run: ./xenia-build.py build --config=Release --target=xenia-libretro --target-arch=arm64 -- -- -j3
+      - name: Verify And Package On The Runner
+        shell: bash
+        env:
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          python3 .ci-tools/.ci/package-release.py build \
+            --core build-arm64/bin/macOS/Release/xenia_edge_libretro.dylib \
+            --tag "$RELEASE_TAG" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rolling-release-macos-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Verify And Publish Release
+    needs: macos
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: rolling-release-macos-arm64
+          path: dist
+      - name: Verify Downloaded Package And Tagged Source
+        shell: bash
+        run: |
+          python3 .ci/package-release.py verify --tag "$RELEASE_TAG" --output dist \
+            --source-commit "$(git rev-parse "$RELEASE_TAG^{commit}")"
+      - name: Publish CI Artifacts And Release Notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="release-notes/${RELEASE_TAG#v}.md"
+          test -f "$notes"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest \
+              --title "Xenia Edge Libretro ${RELEASE_TAG#v}" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --latest \
+              --title "Xenia Edge Libretro ${RELEASE_TAG#v}" --notes-file "$notes"
+          fi

@@ -4,6 +4,8 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## Unreleased
 
+- Build, verify, package and publish rolling releases entirely on GitHub Actions. A manual release can rebuild an existing immutable tag with separately pinned current CI tooling; package manifests record both source and workflow revisions. Local installation uses the downloaded CI artifact.
+
 ## 0.1.0.1 - 25 October 2026
 
 - Publish the first rolling release of the Zer0one fork, using four-component `v0.1.0.N` tags and the standard core filename. Build CI follows `main`; macOS ARM64 release packages include the matching core information file and checksums. MoltenVK remains a separate frontend/provider installation.
