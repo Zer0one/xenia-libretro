@@ -27,7 +27,7 @@
 #include <vulkan/vulkan.h>
 
 #define RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION 5
-#define RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION 1
+#define RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION 2
 
 struct retro_vulkan_image
 {
@@ -79,6 +79,24 @@ typedef bool (*retro_vulkan_create_device_t)(
 
 typedef void (*retro_vulkan_destroy_device_t)(void);
 
+/* v2 declarations from RetroArch fce35fc7's libretro-common header. */
+typedef VkInstance (*retro_vulkan_create_instance_wrapper_t)(
+      void *opaque, const VkInstanceCreateInfo *create_info);
+typedef VkInstance (*retro_vulkan_create_instance_t)(
+      PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+      const VkApplicationInfo *app,
+      retro_vulkan_create_instance_wrapper_t create_instance_wrapper,
+      void *opaque);
+typedef VkDevice (*retro_vulkan_create_device_wrapper_t)(
+      VkPhysicalDevice gpu, void *opaque,
+      const VkDeviceCreateInfo *create_info);
+typedef bool (*retro_vulkan_create_device2_t)(
+      struct retro_vulkan_context *context, VkInstance instance,
+      VkPhysicalDevice gpu, VkSurfaceKHR surface,
+      PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+      retro_vulkan_create_device_wrapper_t create_device_wrapper,
+      void *opaque);
+
 struct retro_hw_render_context_negotiation_interface_vulkan
 {
    enum retro_hw_render_context_negotiation_interface_type interface_type;
@@ -86,6 +104,9 @@ struct retro_hw_render_context_negotiation_interface_vulkan
    retro_vulkan_get_application_info_t get_application_info;
    retro_vulkan_create_device_t create_device;
    retro_vulkan_destroy_device_t destroy_device;
+   /* Frontends negotiating v1 ignore these appended members. */
+   retro_vulkan_create_instance_t create_instance;
+   retro_vulkan_create_device2_t create_device2;
 };
 
 struct retro_hw_render_interface_vulkan

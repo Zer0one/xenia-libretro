@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <functional>
 
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
@@ -56,18 +57,105 @@ static void WriteIoStatus(X_IO_STATUS_BLOCK* status_block, X_STATUS status,
   status_block->status = status;
 }
 
-// File-pointer reads (offset -1), reads at or past EOF and reads issued with an
-// APC from a user APC routine complete inline.
-static bool CompletesAsync(XFile* file, uint64_t byte_offset, XThread* thread,
-                           bool queues_apc) {
-  if (file->is_synchronous() || byte_offset >= file->entry()->size()) {
+// A handle bound to a completion port takes no APC routine. A synchronous
+// handle uses its file position, marked -1, without an offset or with
+// FILE_USE_FILE_POINTER_POSITION (-2). An async handle needs an offset. A write
+// given FILE_WRITE_TO_END_OF_FILE (-1) appends at XFile::kEndOfFile. Any other
+// negative offset is invalid.
+static X_STATUS ValidateRequest(XFile* file, uint32_t apc_routine,
+                                lpqword_t byte_offset_ptr, bool is_write,
+                                uint64_t* out_byte_offset) {
+  *out_byte_offset = uint64_t(-1);
+  if (apc_routine && file->HasCompletionPort()) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  if (!byte_offset_ptr) {
+    return file->is_synchronous() ? X_STATUS_SUCCESS
+                                  : X_STATUS_INVALID_PARAMETER;
+  }
+  int64_t byte_offset = int64_t(uint64_t(*byte_offset_ptr));
+  if (byte_offset == -2 && file->is_synchronous()) {
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset == -1 && is_write) {
+    *out_byte_offset = XFile::kEndOfFile;
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset < 0) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  *out_byte_offset = uint64_t(byte_offset);
+  return X_STATUS_SUCCESS;
+}
+
+// Without a file system that queues every request, a zero-length transfer, a
+// read at or past EOF, a write that extends the file and a buffered transfer
+// complete inline.
+static bool CompletesAsync(XFile* file, uint32_t length, uint64_t byte_offset,
+                           bool is_write) {
+  if (file->is_synchronous()) {
     return false;
   }
-  // TODO(has207): Likely not hardware accurate. Cars chains ReadFileEx from its
-  // completion routine, then only sleeps non-alertably. Completing inline
-  // queues the APC while the current delivery loop still drains the list. How
-  // the console delivers it is unknown.
-  return !(queues_apc && thread->in_user_apc());
+  if (file->device()->queues_all_requests()) {
+    return true;
+  }
+  if (file->is_buffered() || !length) {
+    return false;
+  }
+  uint64_t file_size = file->entry()->size();
+  return is_write ? byte_offset + length <= file_size : byte_offset < file_size;
+}
+
+// Runs |transfer|, which returns a status and fills in the bytes moved, then
+// reports the completion. A request that pends runs on an I/O worker.
+static X_STATUS SubmitRequest(const object_ref<XFile>& file,
+                              const object_ref<XEvent>& ev,
+                              uint32_t apc_routine, uint32_t apc_context,
+                              X_IO_STATUS_BLOCK* status_block,
+                              uint32_t status_block_address, bool pends,
+                              std::function<X_STATUS(uint32_t*)> transfer) {
+  auto thread = retain_object(XThread::GetCurrentThread());
+  // Cleared at issue, so a wait cannot return on an earlier completion.
+  if (ev) {
+    ev->Reset();
+  }
+  file->ResetWaitState();
+  auto complete = [file, ev, thread, apc_routine, apc_context, status_block,
+                   status_block_address, transfer = std::move(transfer)](
+                      bool posted, bool cancelled) {
+    uint32_t bytes = 0;
+    X_STATUS status = cancelled ? X_STATUS_CANCELLED : transfer(&bytes);
+    // A failure the caller was not told PENDING for completes nothing.
+    if (!posted && XFAILED(status)) {
+      return status;
+    }
+    if (status_block) {
+      WriteIoStatus(status_block, status, bytes);
+    }
+    if (QueuesApc(apc_routine, apc_context)) {
+      QueueIoApc(thread.get(), apc_routine, apc_context, status_block_address);
+    }
+    file->NotifyCompletion(status, bytes, apc_context);
+    if (ev) {
+      ev->Set(KernelState::kIoDiskIncrement, false);
+    }
+    return status;
+  };
+  if (pends) {
+    if (status_block) {
+      status_block->status = X_STATUS_PENDING;
+      status_block->information = 0;
+    }
+    file->PostIo(thread.get(),
+                 [complete = std::move(complete)](bool cancelled) {
+                   complete(true, cancelled);
+                 });
+    return X_STATUS_PENDING;
+  }
+  X_STATUS status = complete(false, false);
+  // A kernel APC the completion queued runs before the service returns.
+  xeProcessKernelApcs(thread->thread_state()->context());
+  return status;
 }
 
 struct CreateOptions {
@@ -75,6 +163,7 @@ struct CreateOptions {
   static constexpr uint32_t FILE_DIRECTORY_FILE = 0x00000001;
   // Optimization - files access will be sequential, not random.
   static constexpr uint32_t FILE_SEQUENTIAL_ONLY = 0x00000004;
+  static constexpr uint32_t FILE_NO_INTERMEDIATE_BUFFERING = 0x00000008;
   static constexpr uint32_t FILE_SYNCHRONOUS_IO_ALERT = 0x00000010;
   static constexpr uint32_t FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
   static constexpr uint32_t FILE_NON_DIRECTORY_FILE = 0x00000040;
@@ -228,8 +317,10 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
     bool synchronous =
         alertable ||
         (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
+    bool buffered =
+        !(create_options & CreateOptions::FILE_NO_INTERMEDIATE_BUFFERING);
     file = object_ref<XFile>(
-        new XFile(kernel_state(), vfs_file, synchronous, alertable));
+        new XFile(kernel_state(), vfs_file, synchronous, alertable, buffered));
 
     // Handle ref is incremented, so return that.
     handle = file->handle();
@@ -277,79 +368,35 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
   }
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
-  } else if (XSUCCEEDED(result) && !file->is_synchronous() &&
-             !byte_offset_ptr) {
-    // Without a byte offset, only a synchronous handle uses its file position.
-    result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result = ValidateRequest(file.get(), static_cast<uint32_t>(apc_routine_ptr),
+                             byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
     uint32_t buffer_address = buffer.guest_address();
     uint32_t length = buffer_length;
-    uint64_t byte_offset =
-        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
-    uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
-    X_IO_STATUS_BLOCK* status_block = io_status_block;
-    uint32_t status_block_address = io_status_block.guest_address();
-    auto thread = retain_object(XThread::GetCurrentThread());
-    auto complete = [file, ev, thread, buffer_address, length, byte_offset,
-                     apc_routine, apc_context_address, status_block,
-                     status_block_address](bool posted) {
-      uint32_t bytes_read = 0;
-      X_STATUS status = file->Read(buffer_address, length, byte_offset,
-                                   &bytes_read, apc_context_address, false);
-      if (XSUCCEEDED(status)) {
-        if (auto patch = kernel_state()->xmp_volume_patch()) {
-          auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
-          patch->OnFileRead(file->entry()->name(), host_buf, length,
-                            buffer_address);
-        }
-      }
-      if (status_block) {
-        WriteIoStatus(status_block, status, bytes_read);
-      }
-      // A caller told PENDING always gets its APC, as on NT.
-      bool pending =
-          posted || (!file->is_synchronous() && status != X_STATUS_END_OF_FILE);
-      if (QueuesApc(apc_routine, apc_context_address) &&
-          (pending || status == X_STATUS_SUCCESS)) {
-        QueueIoApc(thread.get(), apc_routine, apc_context_address,
-                   status_block_address);
-      }
-      file->NotifyCompletion(status, bytes_read, apc_context_address);
-      if (ev) {
-        ev->Set(KernelState::kIoDiskIncrement, false);
-      }
-      return status;
-    };
-
-    if (CompletesAsync(file.get(), byte_offset, thread.get(),
-                       QueuesApc(apc_routine, apc_context_address))) {
-      if (ev) {
-        ev->Reset();
-      }
-      if (status_block) {
-        status_block->status = X_STATUS_PENDING;
-        status_block->information = 0;
-      }
-      file->PostIo([complete = std::move(complete)]() { complete(true); });
-      result = X_STATUS_PENDING;
-    } else {
-      result = complete(false);
-      // A kernel APC the completion queued runs before the service returns.
-      xeProcessKernelApcs(thread->thread_state()->context());
-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
-        result = X_STATUS_PENDING;
-      }
-    }
-  }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
+    result = SubmitRequest(
+        file, ev, static_cast<uint32_t>(apc_routine_ptr), apc_context_address,
+        io_status_block, io_status_block.guest_address(),
+        CompletesAsync(file.get(), length, byte_offset, false),
+        [file, buffer_address, length, byte_offset,
+         apc_context_address](uint32_t* bytes_read) {
+          X_STATUS status = file->Read(buffer_address, length, byte_offset,
+                                       bytes_read, apc_context_address, false);
+          if (XSUCCEEDED(status)) {
+            if (auto patch = kernel_state()->xmp_volume_patch()) {
+              auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
+              patch->OnFileRead(file->entry()->name(), host_buf, length,
+                                buffer_address);
+            }
+          }
+          return status;
+        });
   }
 
   return result;
@@ -368,71 +415,31 @@ dword_result_t NtReadFileScatter_entry(
   }
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
-  } else if (XSUCCEEDED(result) && !file->is_synchronous() &&
-             !byte_offset_ptr) {
-    // Without a byte offset, only a synchronous handle uses its file position.
+  } else if (XSUCCEEDED(result) &&
+             (file->is_buffered() || file->device()->name() == "STFS")) {
+    // Scatter reads need an unbuffered handle. STFS takes none.
     result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result = ValidateRequest(file.get(), static_cast<uint32_t>(apc_routine_ptr),
+                             byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
     uint32_t segments_address = segment_array.guest_address();
     uint32_t read_length = length;
-    uint64_t byte_offset =
-        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
-    uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
-    X_IO_STATUS_BLOCK* status_block = io_status_block;
-    uint32_t status_block_address = io_status_block.guest_address();
-    auto thread = retain_object(XThread::GetCurrentThread());
-    auto complete = [file, ev, thread, segments_address, read_length,
-                     byte_offset, apc_routine, apc_context_address,
-                     status_block, status_block_address]() {
-      uint32_t bytes_read = 0;
-      X_STATUS status =
-          file->ReadScatter(segments_address, read_length, byte_offset,
-                            &bytes_read, apc_context_address, false);
-      if (status_block) {
-        WriteIoStatus(status_block, status, bytes_read);
-      }
-      // An async handle is always told PENDING, and then always gets its APC.
-      if (QueuesApc(apc_routine, apc_context_address) &&
-          (!file->is_synchronous() || status == X_STATUS_SUCCESS)) {
-        QueueIoApc(thread.get(), apc_routine, apc_context_address,
-                   status_block_address);
-      }
-      file->NotifyCompletion(status, bytes_read, apc_context_address);
-      if (ev) {
-        ev->Set(KernelState::kIoDiskIncrement, false);
-      }
-      return status;
-    };
-
-    if (CompletesAsync(file.get(), byte_offset, thread.get(),
-                       QueuesApc(apc_routine, apc_context_address))) {
-      if (ev) {
-        ev->Reset();
-      }
-      if (status_block) {
-        status_block->status = X_STATUS_PENDING;
-        status_block->information = 0;
-      }
-      file->PostIo(std::move(complete));
-      result = X_STATUS_PENDING;
-    } else {
-      result = complete();
-      // A kernel APC the completion queued runs before the service returns.
-      xeProcessKernelApcs(thread->thread_state()->context());
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
-      }
-    }
-  }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
+    result = SubmitRequest(
+        file, ev, static_cast<uint32_t>(apc_routine_ptr), apc_context_address,
+        io_status_block, io_status_block.guest_address(),
+        CompletesAsync(file.get(), read_length, byte_offset, false),
+        [file, segments_address, read_length, byte_offset,
+         apc_context_address](uint32_t* bytes_read) {
+          return file->ReadScatter(segments_address, read_length, byte_offset,
+                                   bytes_read, apc_context_address, false);
+        });
   }
 
   return result;
@@ -445,85 +452,44 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
                                  lpvoid_t buffer, dword_t buffer_length,
                                  lpqword_t byte_offset_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
-  XThread* const thread = XThread::GetCurrentThread();
 
-  // Grab event to signal.
-  bool signal_event = false;
   auto ev = kernel_state()->object_table()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
   }
 
-  // Grab file.
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
-  } else if (XSUCCEEDED(result) && !file->is_synchronous() &&
-             !byte_offset_ptr) {
-    // Without a byte offset, only a synchronous handle uses its file position.
-    result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result = ValidateRequest(file.get(), apc_routine, byte_offset_ptr, true,
+                             &byte_offset);
   }
 
-  // Execute write.
   if (XSUCCEEDED(result)) {
-    // TODO(benvanik): async path.
-    if (true || file->is_synchronous()) {
-      // Synchronous request.
-      uint32_t bytes_written = 0;
-      result = file->Write(
-          buffer.guest_address(), buffer_length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-          &bytes_written, apc_context);
-
-      if (io_status_block) {
-        io_status_block->status = result;
-        io_status_block->information = static_cast<uint32_t>(bytes_written);
-      }
-
-      // Queue the APC callback. It must be delivered via the APC mechanism even
-      // though were are completing immediately.
-      if (QueuesApc(apc_routine, apc_context.guest_address())) {
-        QueueIoApc(thread, apc_routine, apc_context.guest_address(),
-                   io_status_block.guest_address());
-      }
-
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
-      }
-
-      // Mark that we should signal the event now. We do this after
-      // we have written the info out.
-      signal_event = true;
-
-      if (XSUCCEEDED(result)) {
-        if (auto patch = kernel_state()->xmp_volume_patch()) {
-          auto host_buf =
-              kernel_memory()->TranslateVirtual(buffer.guest_address());
-          patch->OnFileWrite(file->entry()->name(), host_buf, buffer_length,
-                             buffer.guest_address());
-        }
-      }
-    } else {
-      // X_STATUS_PENDING if not returning immediately.
-      result = X_STATUS_PENDING;
-
-      if (io_status_block) {
-        io_status_block->status = X_STATUS_PENDING;
-        io_status_block->information = 0;
-      }
-    }
+    uint32_t buffer_address = buffer.guest_address();
+    uint32_t length = buffer_length;
+    uint32_t apc_context_address = apc_context.guest_address();
+    result = SubmitRequest(
+        file, ev, apc_routine, apc_context_address, io_status_block,
+        io_status_block.guest_address(),
+        CompletesAsync(file.get(), length, byte_offset, true),
+        [file, buffer_address, length, byte_offset,
+         apc_context_address](uint32_t* bytes_written) {
+          X_STATUS status =
+              file->Write(buffer_address, length, byte_offset, bytes_written,
+                          apc_context_address, false);
+          if (XSUCCEEDED(status)) {
+            if (auto patch = kernel_state()->xmp_volume_patch()) {
+              auto host_buf = kernel_memory()->TranslateVirtual(buffer_address);
+              patch->OnFileWrite(file->entry()->name(), host_buf, length,
+                                 buffer_address);
+            }
+          }
+          return status;
+        });
   }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
-  }
-
-  if (ev && signal_event) {
-    ev->Set(KernelState::kIoDiskIncrement, false);
-  }
-  // A kernel APC the write queued runs before the service returns.
-  xeProcessKernelApcs(thread->thread_state()->context());
 
   return result;
 }
@@ -602,15 +568,26 @@ dword_result_t NtRemoveIoCompletion_entry(
 DECLARE_XBOXKRNL_EXPORT2(NtRemoveIoCompletion, kFileSystem, kImplemented,
                          kHighFrequency);
 
-dword_result_t NtCancelIoFile_entry(dword_t handle) {
+dword_result_t NtCancelIoFile_entry(dword_t handle,
+                                    const ppc_context_t& context) {
   auto file = kernel_state()->object_table()->LookupObject<XFile>(handle);
   if (!file) {
     return X_STATUS_INVALID_HANDLE;
   }
-
+  // The calling thread's requests on the file that have yet to start complete
+  // as cancelled. The call returns once the one running has completed,
+  // polling every 10 ms.
+  XThread* thread = XThread::GetCurrentThread();
+  file->CancelPostedIo(thread);
+  while (file->HasPostedIo(thread)) {
+    uint64_t interval = uint64_t(-100000);
+    KeDelayExecutionThread(0, false, &interval, context);
+  }
+  // A kernel APC the completions queued runs before the service returns.
+  xeProcessKernelApcs(context);
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT1(NtCancelIoFile, kFileSystem, kStub);
+DECLARE_XBOXKRNL_EXPORT1(NtCancelIoFile, kFileSystem, kImplemented);
 
 dword_result_t NtQueryFullAttributesFile_entry(
     pointer_t<X_OBJECT_ATTRIBUTES> obj_attribs,
@@ -713,16 +690,18 @@ DECLARE_XBOXKRNL_EXPORT1(NtQueryDirectoryFile, kFileSystem, kImplemented);
 
 dword_result_t NtFlushBuffersFile_entry(
     dword_t file_handle, pointer_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
-  auto result = X_STATUS_SUCCESS;
-
-  if (io_status_block_ptr) {
-    io_status_block_ptr->status = result;
-    io_status_block_ptr->information = 0;
+  auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  if (!file) {
+    return X_STATUS_INVALID_HANDLE;
   }
-
-  return result;
+  // Writes reach the host as they run. On an async handle the flush queues
+  // behind the handle's pending requests, so it completes after them.
+  return SubmitRequest(file, nullptr, 0, 0, io_status_block_ptr,
+                       io_status_block_ptr.guest_address(),
+                       !file->is_synchronous(),
+                       [](uint32_t*) { return X_STATUS_SUCCESS; });
 }
-DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kStub);
+DECLARE_XBOXKRNL_EXPORT1(NtFlushBuffersFile, kFileSystem, kImplemented);
 
 // https://docs.microsoft.com/en-us/windows/win32/devnotes/ntopensymboliclinkobject
 dword_result_t NtOpenSymbolicLinkObject_entry(

@@ -345,15 +345,16 @@ dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
 }
 DECLARE_XAM_EXPORT1(XamReadString, kNone, kImplemented);
 
-dword_result_t XamGetSystemVersion_entry() {
-  // eh, just picking one. If we go too low we may break new games, but
-  // this value seems to be used for conditionally loading symbols and if
-  // we pretend to be old we have less to worry with implementing.
-  // 0x200A3200
-  // 0x20096B00
-  return 0;
+// A kernel version packed as 4.4.16.8 bits.
+static uint32_t PackSystemVersion(const KernelVersion& version) {
+  return uint32_t(version.major) << 28 | (uint32_t(version.minor) & 0xF) << 24 |
+         uint32_t(version.build) << 8 | (uint32_t(version.qfe) & 0xFF);
 }
-DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kStub);
+
+dword_result_t XamGetSystemVersion_entry() {
+  return PackSystemVersion(*kernel_state()->GetKernelVersion());
+}
+DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kImplemented);
 
 void XCustomRegisterDynamicActions_entry() {
   // ???
@@ -381,6 +382,23 @@ dword_result_t XamIsCurrentTitleDash_entry(const ppc_context_t& ctx) {
   return ctx->kernel_state->title_id() == kDashboardID;
 }
 DECLARE_XAM_EXPORT1(XamIsCurrentTitleDash, kNone, kImplemented);
+
+dword_result_t XamSetDashContext_entry(dword_t value,
+                                       const ppc_context_t& ctx) {
+  // checks XexCheckExecutablePrivilege(8) but we don't care
+  if (value != ctx->kernel_state->dash_context_) {
+    ctx->kernel_state->dash_context_ = value;
+    kernel_state()->BroadcastNotification(
+        kXNotificationSystemDashContextChanged, 0);
+  }
+  return 0;
+}
+DECLARE_XAM_EXPORT1(XamSetDashContext, kNone, kImplemented);
+
+dword_result_t XamGetDashContext_entry(const ppc_context_t& ctx) {
+  return ctx->kernel_state->dash_context_;
+}
+DECLARE_XAM_EXPORT1(XamGetDashContext, kNone, kImplemented);
 
 dword_result_t XamGetExecutionId_entry(lpdword_t info_ptr) {
   auto module = kernel_state()->GetExecutableModule();
@@ -523,7 +541,8 @@ static bool NamesDevice(std::string_view path) {
 // flag 4. The D: drive path is only checked for flag 4.
 static void LaunchTitle(std::string path, std::string_view d_drive_path,
                         uint32_t flags) {
-  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  // Unowned, this frame never unwinds.
+  auto* xam = kernel_state()->GetKernelModule<XamModule>("xam.xex").get();
 
   auto& loader_data = xam->loader_data();
   loader_data.launch_flags = flags;
@@ -563,7 +582,7 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
     std::string launch_path = xe::path_to_utf8(path);
 
     XELOGI("XamLoaderLaunchTitle: original host_path={}, launch_path={}",
-           loader_data.host_path, launch_path);
+           xe::strip_pii(loader_data.host_path), launch_path);
 
     // Remove common guest path prefixes (case-insensitive since Xbox
     // paths are case-insensitive, games may pass e.g. "GAME:\")
@@ -595,7 +614,7 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
     }
 
     XELOGI("XamLoaderLaunchTitle: normalized host_path={}, launch_path={}",
-           xe::path_to_utf8(host_path), launch_path);
+           xe::strip_pii(xe::path_to_utf8(host_path)), launch_path);
 
     // Handle title launch in-process via full Shutdown/Setup cycle. Disabled
     // on macOS — pthread_cancel there doesn't run C++ destructors, so
@@ -606,7 +625,7 @@ static void LaunchTitle(std::string path, std::string_view d_drive_path,
       auto emulator = kernel_state()->emulator();
 
       XELOGI("XamLoaderLaunchTitle: in-process relaunch to '{}'",
-             xe::path_to_utf8(host_path));
+             xe::strip_pii(xe::path_to_utf8(host_path)));
 
       auto new_host_path = xe::path_to_utf8(host_path);
       auto new_launch_module = launch_path;
@@ -1164,6 +1183,16 @@ dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
   return X_E_NOT_IMPLEMENTED;
 }
 DECLARE_XAM_EXPORT1(XamLogLocalizationEtx, kNone, kStub);
+
+dword_result_t XamUpdateGetBaseSystemVersion_entry() {
+  return PackSystemVersion(KernelVersion(kBaseKernelBuildVersion));
+}
+DECLARE_XAM_EXPORT1(XamUpdateGetBaseSystemVersion, kNone, kImplemented);
+
+dword_result_t XamUpdateGetCurrentSystemVersion_entry() {
+  return PackSystemVersion(*kernel_state()->GetKernelVersion());
+}
+DECLARE_XAM_EXPORT1(XamUpdateGetCurrentSystemVersion, kNone, kImplemented);
 
 }  // namespace xam
 }  // namespace kernel

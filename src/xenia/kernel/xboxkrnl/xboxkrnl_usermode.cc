@@ -72,15 +72,17 @@ constexpr uint32_t kRecordParameterCount = 0x10;
 constexpr uint32_t kRecordInformation = 0x14;
 constexpr uint32_t kRecordSize = 0x1C;
 
-// TODO(has207): POSIX runs the fault handler on the thread's signal stack, and
-// running guest code from it lets the next fault on that thread overwrite the
-// suspended signal frame. Delivering there needs the fault to divert to a
-// thunk on the fiber's own stack and resume through a saved host context.
-#if XE_PLATFORM_WIN32
+// POSIX runs the fault handler on the thread's signal stack, and running guest
+// code from it lets the next fault on that thread overwrite the suspended
+// signal frame, so a fault there diverts to a thunk on the fiber's own stack
+// and resumes the access through the host context it saved.
+// TODO(has207): a64 has no ResumeHostContext, so POSIX there can't resume the
+// access a fault interrupted.
+#if XE_PLATFORM_WIN32 || XE_ARCH_AMD64
 constexpr bool kDeliverUserFaults = true;
 #else
 constexpr bool kDeliverUserFaults = false;
-#endif  // XE_PLATFORM_WIN32
+#endif  // XE_PLATFORM_WIN32 || XE_ARCH_AMD64
 
 constexpr uint32_t kReturnSentinel = 0xBCBCBCBC;
 // Keeps the handler clear of the frame that called KeEnterUserMode.
@@ -312,6 +314,55 @@ uint32_t UserModeCodeFault(PPCContext* context, uint32_t address) {
   return resume_address != address ? resume_address : 0;
 }
 
+#if XE_PLATFORM_WIN32 || XE_ARCH_AMD64
+// Runs the trap handler for a fault on the guest instruction at |address|.
+// Returns whether the interrupted access runs again, false if the fiber has to
+// restart at the address the handler left instead.
+bool RunFaultHandler(PPCContext* context, XThread* thread, uint32_t address) {
+  auto user_mode = thread->user_mode();
+  uint32_t resume_address;
+  const bool handler_returned = TrapIntoHandler(
+      context, thread, user_mode->exception_record, address, &resume_address);
+  if (handler_returned && resume_address == address) {
+    return true;
+  }
+  user_mode->restart_pending = true;
+  user_mode->restart_address = handler_returned ? resume_address : address;
+  return false;
+}
+#endif  // XE_PLATFORM_WIN32 || XE_ARCH_AMD64
+
+#if !XE_PLATFORM_WIN32 && XE_ARCH_AMD64
+// A fault handed to the thunk below. The thunk copies it out before running
+// any guest code, so another fiber of the thread can use the slot while this
+// one is parked in a trap.
+struct DivertedFault {
+  HostThreadContext context;
+  // The guest instruction the fault interrupted.
+  uint32_t address;
+};
+thread_local DivertedFault diverted_fault;
+
+// Runs the trap handler on the faulting fiber's own stack, where guest code is
+// safe to run, then resumes the access it interrupted. Never returns.
+void UserModeFaultThunk() {
+  XThread* thread = XThread::GetCurrentThread();
+  const HostThreadContext context = diverted_fault.context;
+  const uint32_t address = diverted_fault.address;
+  // The signal return put back the MXCSR the fault ran with, which the context
+  // doesn't carry and the handler's guest code changes.
+  const uint32_t mxcsr = _mm_getcsr();
+  if (RunFaultHandler(thread->thread_state()->context(), thread, address)) {
+    // The retry runs from the host registers, so changes the handler made to
+    // the frame are lost.
+    // TODO(has207): load the frame back into the host context instead.
+    _mm_setcsr(mxcsr);
+    ResumeHostContext(&context);
+  }
+  RestartUserModeThunk();
+}
+#endif  // !XE_PLATFORM_WIN32 && XE_ARCH_AMD64
+
 // A user mode access with no page table entry, or one its entry's protection
 // forbids. The guest's handler can fix the entry and return, and the access
 // runs again.
@@ -335,22 +386,25 @@ Memory::UserFaultResult UserModeFault(uint32_t fault_address, bool is_write,
   const uint32_t address = function->MapMachineCodeToGuestAddress(ex->pc());
   FillAccessViolationRecord(user_mode, address, is_write, fault_address);
 
-  uint32_t resume_address;
-  const bool handler_returned = TrapIntoHandler(
-      context, thread, user_mode->exception_record, address, &resume_address);
-  if (handler_returned && resume_address == address) {
+#if XE_PLATFORM_WIN32
+  if (RunFaultHandler(context, thread, address)) {
     // The retry runs from the host registers, so changes the handler made to
     // the frame are lost.
     // TODO(has207): load the frame back into the host context instead.
     return Memory::UserFaultResult::kTaken;
   }
-  // The handler dispatched the fault elsewhere, or left user mode and the
-  // kernel resumed the trap with registers of its own. Either way user mode
-  // continues from the context rather than from the faulting access.
-  user_mode->restart_pending = true;
-  user_mode->restart_address = handler_returned ? resume_address : address;
   DivertToThunk(ex, &RestartUserModeThunk);
   return Memory::UserFaultResult::kDiverted;
+#elif XE_ARCH_AMD64
+  // The thunk gets the registers the access has to resume from.
+  diverted_fault.context = *ex->thread_context();
+  diverted_fault.address = address;
+  DivertToThunk(ex, &UserModeFaultThunk);
+  return Memory::UserFaultResult::kDiverted;
+#else
+  // kDeliverUserFaults keeps the hook off without a way to resume the access.
+  return Memory::UserFaultResult::kNotTaken;
+#endif  // XE_PLATFORM_WIN32
 }
 
 std::unique_ptr<XThread::UserMode::UserFiber> CreateUserFiber(

@@ -19,7 +19,8 @@ std::unique_ptr<XContentContainerDevice>
 XContentContainerDevice::CreateContentDevice(
     const std::string_view mount_path, const std::filesystem::path& host_path) {
   if (!std::filesystem::exists(host_path)) {
-    XELOGE("Path to XContent container does not exist: {}", host_path);
+    XELOGE("Path to XContent container does not exist: {}",
+           xe::strip_pii(xe::path_to_utf8(host_path)));
     return nullptr;
   }
 
@@ -75,7 +76,8 @@ XContentContainerDevice::~XContentContainerDevice() {}
 
 bool XContentContainerDevice::Initialize() {
   if (!std::filesystem::exists(host_path_)) {
-    XELOGE("Path to XContent container does not exist: {}", host_path_);
+    XELOGE("Path to XContent container does not exist: {}",
+           xe::strip_pii(xe::path_to_utf8(host_path_)));
     return false;
   }
 
@@ -83,7 +85,8 @@ bool XContentContainerDevice::Initialize() {
     return false;
   }
 
-  XELOGI("Loading XContent header file: {}", host_path_);
+  XELOGI("Loading XContent header file: {}",
+         xe::strip_pii(xe::path_to_utf8(host_path_)));
   auto header_file = xe::filesystem::OpenFile(host_path_, "rb");
   if (!header_file) {
     XELOGE("Error opening XContent header file.");
@@ -169,7 +172,7 @@ XContentContainerDevice::ContentDataFromHeader(
   if (name.empty()) {
     // Find first filled language and use it. It might be incorrect, but meh
     // until stfs support is done.
-    for (uint8_t i = 0; i < header.content_metadata.kNumLanguagesV2; i++) {
+    for (uint32_t i = 1; i <= header.content_metadata.kNumLanguagesV2; i++) {
       name = header.content_metadata.display_name((XLanguage)i);
       if (!name.empty()) {
         break;
@@ -180,6 +183,17 @@ XContentContainerDevice::ContentDataFromHeader(
   data.set_display_name(name);
 
   return data;
+}
+
+uint32_t XContentContainerDevice::LicenseMaskFromHeader(
+    const XContentContainerHeader& header) {
+  uint32_t final_license = 0;
+  for (uint8_t i = 0; i < license_count; i++) {
+    if (header.content_header.licenses[i].license_flags) {
+      final_license |= header.content_header.licenses[i].license_bits;
+    }
+  }
+  return final_license;
 }
 
 kernel::xam::XCONTENT_AGGREGATE_DATA XContentContainerDevice::content_header()

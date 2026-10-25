@@ -40,7 +40,7 @@ static void install(const fs::path &path, const unsigned char *data,
   std::ofstream out(path, std::ios::binary);
   out.write(reinterpret_cast<const char *>(data),
             static_cast<std::streamsize>(size));
-  if (out) XELOGI("Wrote {}", path.string());
+  if (out) XELOGI("Wrote {}", xe::strip_pii(xe::path_to_utf8(path)));
 }
 
 void install_files(const fs::path &root) {

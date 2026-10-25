@@ -20,9 +20,10 @@ namespace vfs {
 
 HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                const std::filesystem::path& host_path,
-                               bool read_only, bool collapse_content_packages)
+                               bool read_only, bool collapse_content_packages,
+                               const std::string_view name)
     : Device(mount_path),
-      name_("STFS"),
+      name_(name),
       host_path_(host_path),
       read_only_(read_only),
       collapse_content_packages_(collapse_content_packages) {}
@@ -145,7 +146,7 @@ void HostPathDevice::PopulateEntry(
         XELOGW(
             "HostPathDevice: {} is already on the path being walked; not "
             "following it again",
-            xe::path_to_utf8(parent_entry->host_path()));
+            xe::strip_pii(xe::path_to_utf8(parent_entry->host_path())));
         return;
       }
     }

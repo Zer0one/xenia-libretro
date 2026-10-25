@@ -25,6 +25,8 @@ src/xenia/hid/hid_demo.cc
 src/xenia/hid/keyboard
 src/xenia/hid/sdl
 src/xenia/kernel/testing
+src/xenia/kernel/xam/testing
+src/xenia/net/testing
 src/xenia/tools
 src/xenia/ui/advanced_settings_dialog_wx.cc
 src/xenia/ui/advanced_settings_dialog_wx.h
@@ -92,11 +94,14 @@ tools/diff.py
 tools/find_untested_instructions.py
 tools/generate_map.idc
 tools/gpu-trace-diff.py
+tools/gpugen
 tools/ppc-instructions.xml
 tools/ppc-table-gen.py
 tools/shader-playground
 tools/vulkan-copy-bench
 tools/xenosci
+tools/xamgen
+tools/xex
 xb
 xb.bat
 xb.ps1

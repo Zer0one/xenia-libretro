@@ -154,10 +154,14 @@ class VulkanPresenter final : public Presenter {
   // On a device shared with the frontend: the guest output blitted (to
   // R8G8B8A8) straight into an image of the frontend's frame, left in
   // SHADER_READ_ONLY_OPTIMAL. target_for gets the output's size and gives
-  // the image, VK_NULL_HANDLE to skip. Waits for the blit.
+  // the image and its completion semaphore, VK_NULL_HANDLE to skip. The caller
+  // must wait for the frontend's previous use of sync_index before calling.
+  // The frontend must wait on the returned semaphore. wait_for_completion is a
+  // compatibility path for drivers whose blocking present starves queue users.
   bool BlitGuestOutputToImage(
-      const std::function<VkImage(uint32_t width, uint32_t height)>&
-          target_for,
+      uint32_t sync_index, bool wait_for_completion,
+      const std::function<VkImage(uint32_t width, uint32_t height,
+                                  VkSemaphore& ready_semaphore)>& target_for,
       uint32_t& width_out, uint32_t& height_out);
 #endif
 
@@ -510,11 +514,19 @@ class VulkanPresenter final : public Presenter {
     VkFence fence = VK_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
-    // BlitGuestOutputToImage's, made on first use
-    VkCommandPool direct_cmd_pool = VK_NULL_HANDLE;
-    VkCommandBuffer direct_cmd = VK_NULL_HANDLE;
   };
   GPUBlitResources gpu_blit_;
+  struct DirectBlitResources {
+    VkCommandPool cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint64_t submission = 0;
+    std::shared_ptr<GuestOutputImage> source;
+  };
+  // Command buffers and source lifetimes follow frontend sync slots, rather
+  // than forcing completion of the newest blit on the CPU every retro_run.
+  std::vector<DirectBlitResources> direct_blits_;
+  VulkanGPUCompletionTimeline direct_blit_completion_timeline_{
+      vulkan_device_, "libretro-blit"};
   void DestroyGPUBlitResources();
   bool CreateGPUBlitResources(uint32_t w, uint32_t h);
 #endif

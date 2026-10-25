@@ -746,8 +746,9 @@ class Memory {
     kNotTaken,
     // The guest's handler returned, so retry the access.
     kTaken,
-    // User mode continues elsewhere and |ex| was diverted there, so the access
-    // is abandoned.
+    // |ex| was diverted, so the fault's own host frames are gone. User mode
+    // continues elsewhere, or a thunk runs the handler and resumes the access
+    // itself.
     kDiverted,
   };
 
@@ -836,7 +837,7 @@ class Memory {
 
  private:
 #if XE_PLATFORM_MAC
-  int MapViewsMac();
+  int MapViewsMac(uint8_t* mapping_base);
 #endif
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();
@@ -858,10 +859,11 @@ class Memory {
   // The kind byte the descriptor gives the segment of |user_address|.
   uint8_t UserSegmentKind(uint32_t user_address);
   // The physical address the page table translates a user mode address to,
-  // and the PP bits of its entry.
+  // the PP and changed bits of its entry, and the host address of the entry.
   UserPageState TranslateUserPage(uint32_t user_address,
                                   uint32_t* out_physical_address,
-                                  uint32_t* out_protection = nullptr);
+                                  uint32_t* out_protection = nullptr,
+                                  uint8_t** out_entry = nullptr);
   // Whether one view of the 64 KB |page| starting at |physical_address| shows
   // what the 4 KB entries of a small segment name, with one protection.
   bool UserPageBlockIsContiguous(uint32_t page, uint32_t physical_address);
@@ -880,8 +882,9 @@ class Memory {
                        uint64_t file_offset);
   // The host access an entry's PP bits give user mode code.
   xe::memory::PageAccess UserEntryAccess(uint32_t protection) const;
-  // The host access a user mode piece gets from its entry and the write watch
-  // on the physical page it shows. Under the lock.
+  // The host access a user mode piece gets from its entry, including its
+  // changed bit, and the write watch on the physical page it shows. Under the
+  // lock.
   xe::memory::PageAccess UserPieceAccess(uint32_t piece) const;
   // Protects |count| pieces from |first_piece|, mapped read-write, to their
   // UserPieceAccess. Under the lock.
@@ -892,6 +895,15 @@ class Memory {
   // Reports a write fault at |window_offset| on a watched page. Under the lock.
   // Returns whether the page was watched.
   bool TriggerUserWriteWatch(uint32_t window_offset);
+  // Sets the changed bit of the guest's entry at |entry|.
+  static void SetUserEntryChanged(uint8_t* entry);
+  // Records whether |piece|, just mapped from the entry for |user_address|,
+  // waits for a write to set the entry's changed bit. Under the lock.
+  void TrackUserPieceChange(uint32_t piece, uint32_t user_address);
+  // Sets the changed bit of the entry behind a write fault at |window_offset|
+  // and lets the pieces it maps be written. Under the lock. Returns whether the
+  // piece was waiting for that write.
+  bool MarkUserPieceChanged(uint32_t window_offset);
   // Calls |fn(piece)| for each user mode piece showing a physical 4 KB page.
   // Under the lock.
   template <typename Fn>
@@ -939,6 +951,9 @@ class Memory {
                                         uint32_t address, uint32_t value);
   // A PTE is the physical address with the protection in its low bits.
   static constexpr uint32_t kUserEntryProtection = 0x3;
+  // The console sets C in the entry on the first user mode write through it.
+  // XeFu clears it to find which pages the guest it emulates has written.
+  static constexpr uint32_t kUserEntryChanged = 0x80;
   static constexpr uint32_t kUserTableSmall = 0x000;   // u16[512], by >> 23
   static constexpr uint32_t kUserTableLarge = 0x400;   // u32[256], by >> 24
   static constexpr uint32_t kUserTableMedium = 0x800;  // u16[32], by >> 27
@@ -1002,6 +1017,9 @@ class Memory {
   std::vector<std::vector<uint32_t>> user_block_pieces_;
   // A bit per physical 4 KB page whose next user mode write is reported.
   std::vector<uint64_t> user_write_watched_;
+  // A bit per 4 KB piece whose entry allows writes with its changed bit clear,
+  // kept read-only so its first write can set the bit.
+  std::vector<uint64_t> user_piece_unchanged_;
   bool user_write_watches_ = false;
   std::atomic<UserFaultHook> user_fault_hook_{nullptr};
 

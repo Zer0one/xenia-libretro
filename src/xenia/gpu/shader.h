@@ -552,9 +552,11 @@ struct ParsedTextureFetchInstruction {
   // coordinates snap. The fetch constant side is bit 26 in GetIntegerScaleBits.
   // The epsilon is there so host rounding picks the texel guest trunc would,
   // but near an edge it can push the sample into the next texel. That shows up
-  // as texture seams in 425307EC's virtual texture tables.
+  // as texture seams in 425307EC's virtual texture tables. getBCF snaps like
+  // the fetch it goes with.
   bool CanSnapToTexelCenter(bool use_computed_lod) const {
-    return opcode == ucode::FetchOpcode::kTextureFetch &&
+    return (opcode == ucode::FetchOpcode::kTextureFetch ||
+            opcode == ucode::FetchOpcode::kGetTextureBorderColorFrac) &&
            dimension == xenos::FetchOpDimension::k2D &&
            !attributes.unnormalized_coordinates &&
            AllowsPointSampling(use_computed_lod);
@@ -1079,6 +1081,11 @@ class Shader {
         expected, new_index, std::memory_order_relaxed);
   }
 
+  // Whether a draw has used this vertex shader, or the storage warm-up builds a
+  // pipeline with it.
+  bool is_drawn() const { return is_drawn_; }
+  void set_drawn() { is_drawn_ = true; }
+
   // Dumps the shader's microcode binary and, if analyzed, disassembly, to files
   // in the given directory based on ucode hash. Returns the name of the written
   // file. Can be called at any time, doesn't require the shader to be
@@ -1148,6 +1155,8 @@ class Shader {
   std::unordered_map<uint64_t, Translation*> translations_;
 
   std::atomic<uint32_t> ucode_storage_index_{UINT32_MAX};
+
+  bool is_drawn_ = false;
 
  private:
   void GatherExecInformation(

@@ -121,3 +121,6 @@ CMakeUserPresets.json
 recent.toml
 # the Windows cross build's tools (.ci/build-windows-cross.sh in CI)
 .cross-tools/
+
+# Local test evidence, runner data, deployment backups and release staging.
+/.local/

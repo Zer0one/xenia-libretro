@@ -461,6 +461,7 @@ class Emulator {
   // A relaunch's title failed to start.
   xe::Delegate<> on_relaunch_failed;
   xe::Delegate<bool> on_shader_storage_initialization;
+  xe::Delegate<bool> on_shader_compilation;
   xe::Delegate<> on_patch_apply;
   xe::Delegate<> on_title_name_change;
   xe::Delegate<> on_terminate;

@@ -20,6 +20,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam_system_link.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
@@ -28,19 +29,21 @@
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xnotifylistener.h"
 #include "xenia/kernel/xobject.h"
+#include "xenia/kernel/xsocket.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/kernel/xtimer.h"
 #include "xenia/ui/imgui_host_notification.h"
 
-#include "third_party/crypto/TinySHA1.hpp"
+#include "third_party/mbedtls/include/mbedtls/sha1.h"
 
 DEFINE_bool(apply_title_update, true, "Apply title updates.", "Kernel");
 DEFINE_bool(allow_incompatible_title_update, false,
             "Allow title updates with mismatched signatures to be applied.",
             "Kernel");
 
-DEFINE_uint32(kernel_build_version, 1888, "Define current kernel version",
+DEFINE_uint32(kernel_build_version, 17559, "Define current kernel version",
               "Kernel");
+UPDATE_from_uint32(kernel_build_version, 2026, 10, 15, 4, 1888);
 
 DECLARE_string(cl);
 
@@ -69,10 +72,12 @@ KernelState::KernelState(Emulator* emulator)
   shared_kernel_state_ = this;
   processor_ = emulator->processor();
   file_system_ = emulator->file_system();
+  // Signing in a Live-enabled profile on boot reads the console's country and
+  // language.
+  xconfig_ = std::make_unique<XConfig>();
   xam_state_ = std::make_unique<xam::XamState>(emulator, this);
   guest_scheduler_ = std::make_unique<GuestScheduler>(this);
   smc_ = std::make_unique<SystemManagementController>();
-  xconfig_ = std::make_unique<XConfig>();
 
   InitializeKernelGuestGlobals();
   kernel_version_ = KernelVersion(cvars::kernel_build_version);
@@ -116,6 +121,12 @@ KernelState::~KernelState() {
   }
   idle_io_events_.clear();
 
+  // A reclaimed fiber or a pending wait can keep a socket past the table reset
+  // so its host socket closes here.
+  for (auto& socket : object_table_.GetObjectsByType<XSocket>()) {
+    socket->Abandon();
+  }
+
   // Delete all objects.
   object_table_.Reset();
 
@@ -158,9 +169,10 @@ void KernelState::RunBlockingIo(const std::function<void()>& fn,
       // alertable wait, after the caller writes its status block.
       wait_alertable = 0;
     } else if (status != X_STATUS_SUCCESS) {
-      // A failed poll does not wait so give up the CPU instead of spinning.
+      // A failed poll does not wait so park until the next re-poll instead of
+      // spinning.
       XELOGW("KernelState: blocking I/O wait returned {:08X}", status);
-      guest_scheduler_->YieldCurrentThread(false);
+      guest_scheduler_->BlockCurrentThread(0, 0, false, false);
     }
   }
   ReleaseIoEvent(std::move(event));
@@ -886,6 +898,8 @@ const object_ref<UserModule> KernelState::LoadTitleUpdate(
   auto patch_module = object_ref<UserModule>(new UserModule(this));
 
   X_RESULT result = patch_module->LoadFromFile(patch_path);
+  // Nothing looks the patch up by handle so the last reference frees it.
+  patch_module->ReleaseHandle();
   if (result != X_STATUS_SUCCESS) {
     XELOGE("Failed to load XEX patch, code: {}", result);
     return nullptr;
@@ -905,10 +919,9 @@ bool KernelState::IsPatchSignatureProper(
 
   // Compare hash inside delta descriptor to base XEX signature
   uint8_t digest[0x14];
-  sha1::SHA1 s;
-  s.processBytes(title_module->xex_module()->xex_security_info()->rsa_signature,
-                 0x100);
-  s.finalize(digest);
+  const auto* signature = reinterpret_cast<const uint8_t*>(
+      title_module->xex_module()->xex_security_info()->rsa_signature);
+  mbedtls_sha1(signature, 0x100, digest);
 
   if (memcmp(digest, patch_header->digest_source, 0x14) != 0) {
     XELOGW(
@@ -1108,7 +1121,8 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     // X_ONLINE_S_LOGON_DISCONNECTED
     listener->EnqueueNotification(kXNotificationLiveConnectionChanged,
                                   0x001510F1L);
-    listener->EnqueueNotification(kXNotificationLiveLinkStateChanged, 0);
+    listener->EnqueueNotification(kXNotificationLiveLinkStateChanged,
+                                  xam::SystemLinkEnabled());
   }
 
   if (!has_notified_xmp_startup_ && listener->mask() & kXNotifyXmp) {
@@ -1140,12 +1154,13 @@ void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
 }
 
 void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
-  CompleteOverlappedEx(overlapped_ptr, result, result, 0);
+  CompleteOverlappedEx(overlapped_ptr, result, result, 0,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
-                                       uint32_t extended_error,
-                                       uint32_t length) {
+                                       uint32_t extended_error, uint32_t length,
+                                       X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   // Result last, so a caller polling it for completion reads a valid length.
   XOverlappedSetExtendedError(ptr, extended_error);
@@ -1161,7 +1176,6 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
     }
   }
   if (XOverlappedGetCompletionRoutine(ptr)) {
-    X_HANDLE thread_handle = XOverlappedGetContext(ptr);
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
@@ -1184,9 +1198,8 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr,
                                                 X_RESULT result,
                                                 uint32_t extended_error,
                                                 uint32_t length) {
-  auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
-  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedDeferred(
@@ -1232,7 +1245,7 @@ void KernelState::CompleteOverlappedDeferredEx(
     std::function<void()> post_callback) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  const X_HANDLE thread_handle = XThread::GetCurrentThreadHandle();
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
   if (event_handle) {
     auto ev = object_table()->LookupObject<XObject>(event_handle);
@@ -1244,7 +1257,7 @@ void KernelState::CompleteOverlappedDeferredEx(
   }
   std::lock_guard lock(dispatch_mutex_);
   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
-                             pre_callback, post_callback]() {
+                             thread_handle, pre_callback, post_callback]() {
     if (pre_callback) {
       pre_callback();
     }
@@ -1252,7 +1265,8 @@ void KernelState::CompleteOverlappedDeferredEx(
     xe::threading::Sleep(kDeferredOverlappedDelayMillis);
     uint32_t extended_error, length;
     auto result = completion_callback(extended_error, length);
-    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                         thread_handle);
     if (post_callback) {
       post_callback();
     }

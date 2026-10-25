@@ -31,6 +31,18 @@ bool libretro_vk_capture_gpu_blit(xe::ui::Presenter* presenter,
 // two images of the one device - no readback to host memory and upload back,
 // which cost as much GPU time as a good part of the emulation (NNshi).
 
+// v2 instance negotiation: configure MoltenVK only on this instance, using
+// asynchronous host submission only with the recognized drawable fix.
+VkInstance libretro_vk_create_instance(
+    PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+    const VkApplicationInfo* app,
+    VkInstance (*create_instance_wrapper)(void*, const VkInstanceCreateInfo*),
+    void* opaque);
+
+// A user-facing compatibility notice, or nullptr for the normal path.
+const char* libretro_vk_driver_notice();
+const char* libretro_vk_driver_status();
+
 // From the negotiation's create_device. False leaves RetroArch to make a
 // device of its own, and Xenia then makes its own as before.
 bool libretro_vk_create_shared_device(
@@ -54,10 +66,14 @@ void libretro_vk_set_shared_queue_lock(void (*lock)(void* user),
                                        void* user);
 
 // The guest output blitted into an image of RetroArch's frame (shared device
-// only); target_for gets the size and gives the image.
+// only); target_for gets the size and gives the image and completion semaphore.
+// The frontend must have finished its previous use of sync_index. Its GPU waits
+// on the semaphore passed to set_image. The wrapper retains CPU completion for
+// shared-queue MoltenVK, including asynchronous host submission mode.
 bool libretro_vk_blit_guest_output(
-    xe::ui::Presenter* presenter,
-    const std::function<VkImage(uint32_t width, uint32_t height)>& target_for,
+    xe::ui::Presenter* presenter, uint32_t sync_index,
+    const std::function<VkImage(uint32_t width, uint32_t height,
+                                VkSemaphore& ready_semaphore)>& target_for,
     uint32_t& width_out, uint32_t& height_out);
 
 #endif // LIBRETRO_VK_PRESENTER_H

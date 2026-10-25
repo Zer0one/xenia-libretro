@@ -127,10 +127,12 @@ static struct {
     PFN_vkCreateCommandPool p_vkCreateCommandPool = nullptr;
     PFN_vkCreateImage p_vkCreateImage = nullptr;
     PFN_vkCreateImageView p_vkCreateImageView = nullptr;
+    PFN_vkCreateSemaphore p_vkCreateSemaphore = nullptr;
     PFN_vkDestroyBuffer p_vkDestroyBuffer = nullptr;
     PFN_vkDestroyCommandPool p_vkDestroyCommandPool = nullptr;
     PFN_vkDestroyImage p_vkDestroyImage = nullptr;
     PFN_vkDestroyImageView p_vkDestroyImageView = nullptr;
+    PFN_vkDestroySemaphore p_vkDestroySemaphore = nullptr;
     PFN_vkDeviceWaitIdle p_vkDeviceWaitIdle = nullptr;
     PFN_vkEndCommandBuffer p_vkEndCommandBuffer = nullptr;
     PFN_vkFreeMemory p_vkFreeMemory = nullptr;
@@ -153,10 +155,12 @@ static struct {
 #define vkCreateCommandPool lr_vk.p_vkCreateCommandPool
 #define vkCreateImage lr_vk.p_vkCreateImage
 #define vkCreateImageView lr_vk.p_vkCreateImageView
+#define vkCreateSemaphore lr_vk.p_vkCreateSemaphore
 #define vkDestroyBuffer lr_vk.p_vkDestroyBuffer
 #define vkDestroyCommandPool lr_vk.p_vkDestroyCommandPool
 #define vkDestroyImage lr_vk.p_vkDestroyImage
 #define vkDestroyImageView lr_vk.p_vkDestroyImageView
+#define vkDestroySemaphore lr_vk.p_vkDestroySemaphore
 #define vkDeviceWaitIdle lr_vk.p_vkDeviceWaitIdle
 #define vkEndCommandBuffer lr_vk.p_vkEndCommandBuffer
 #define vkFreeMemory lr_vk.p_vkFreeMemory
@@ -201,6 +205,7 @@ struct xenia_core_state {
     int16_t *audio_buffer;
     size_t   audio_buffer_size;
     double   audio_sample_rate;
+    double   audio_sample_carry;
 
     char game_path[4096];
     char system_dir[4096];
@@ -271,6 +276,9 @@ struct VulkanFrameResources {
     void *staging_mapped;
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd;
+    // Signaled by the core blit, consumed by RetroArch. Kept across emulator
+    // resets; destroyed only after frontend use has completed.
+    VkSemaphore image_ready;
     uint32_t width;
     uint32_t height;
 };
@@ -280,16 +288,22 @@ static struct retro_hw_render_callback hw_render_cb;
 static VulkanFrameResources vk_frames[VK_MAX_SYNC] = {};
 static struct retro_vulkan_image vk_current_image = {};
 static bool vulkan_hw_render_active = false;
+static struct {
+    uint64_t frames = 0;
+    double slot_ms = 0, blit_ms = 0, handoff_ms = 0;
+} s_vulkan_stats;
 
 // The emulator starts once RetroArch has its Vulkan context: with the device
 // negotiated (libretro_vk_create_shared_device), Xenia renders on the device
 // RetroArch makes in its context setup, which comes after retro_load_game.
 static bool s_launch_on_context_reset = false;
+static bool s_vulkan_driver_notice_pending = false;
 // Defined among the libretro API functions, inside their extern "C"
 extern "C" {
 static void launch_game(void);
 }
 static void xenia_stop_emulator(void);
+static void xenia_register_lifetime(void);
 static void xenia_log(enum retro_log_level level, const char *fmt, ...);
 
 static const VkApplicationInfo *xenia_vk_application_info(void) {
@@ -415,6 +429,7 @@ static uint32_t vk_find_memory_type(VkPhysicalDevice gpu,
 static void vk_destroy_frame(VulkanFrameResources &f) {
     if (!vk_hw) return;
     VkDevice dev = vk_hw->device;
+    if (f.image_ready)     { vkDestroySemaphore(dev, f.image_ready, nullptr);  f.image_ready = VK_NULL_HANDLE; }
     if (f.image_view)      { vkDestroyImageView(dev, f.image_view, nullptr);   f.image_view = VK_NULL_HANDLE; }
     if (f.image)           { vkDestroyImage(dev, f.image, nullptr);            f.image = VK_NULL_HANDLE; }
     if (f.image_memory)    { vkFreeMemory(dev, f.image_memory, nullptr);       f.image_memory = VK_NULL_HANDLE; }
@@ -433,6 +448,12 @@ static bool vk_create_frame(VulkanFrameResources &f,
                              uint32_t w, uint32_t h) {
     VkDevice dev = vk_hw->device;
     VkResult res;
+
+    if (libretro_vk_shared_device_active()) {
+        VkSemaphoreCreateInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        if (vkCreateSemaphore(dev, &info, nullptr, &f.image_ready) != VK_SUCCESS)
+            return false;
+    }
 
     // Command pool
     VkCommandPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -538,6 +559,8 @@ static void vulkan_context_reset(void) {
     }
     vk_hw = (const struct retro_hw_render_interface_vulkan *)iface;
     vulkan_hw_render_active = true;
+    if (const char* status = libretro_vk_driver_status())
+        xenia_log(RETRO_LOG_INFO, "%s\n", status);
     // One queue for both: Xenia takes RetroArch's lock around its
     // submissions to it
     libretro_vk_set_shared_queue_lock(
@@ -554,10 +577,12 @@ static void vulkan_context_reset(void) {
     lr_vk.p_vkCreateCommandPool = (PFN_vkCreateCommandPool)vk_hw->get_device_proc_addr(vk_hw->device, "vkCreateCommandPool");
     lr_vk.p_vkCreateImage = (PFN_vkCreateImage)vk_hw->get_device_proc_addr(vk_hw->device, "vkCreateImage");
     lr_vk.p_vkCreateImageView = (PFN_vkCreateImageView)vk_hw->get_device_proc_addr(vk_hw->device, "vkCreateImageView");
+    lr_vk.p_vkCreateSemaphore = (PFN_vkCreateSemaphore)vk_hw->get_device_proc_addr(vk_hw->device, "vkCreateSemaphore");
     lr_vk.p_vkDestroyBuffer = (PFN_vkDestroyBuffer)vk_hw->get_device_proc_addr(vk_hw->device, "vkDestroyBuffer");
     lr_vk.p_vkDestroyCommandPool = (PFN_vkDestroyCommandPool)vk_hw->get_device_proc_addr(vk_hw->device, "vkDestroyCommandPool");
     lr_vk.p_vkDestroyImage = (PFN_vkDestroyImage)vk_hw->get_device_proc_addr(vk_hw->device, "vkDestroyImage");
     lr_vk.p_vkDestroyImageView = (PFN_vkDestroyImageView)vk_hw->get_device_proc_addr(vk_hw->device, "vkDestroyImageView");
+    lr_vk.p_vkDestroySemaphore = (PFN_vkDestroySemaphore)vk_hw->get_device_proc_addr(vk_hw->device, "vkDestroySemaphore");
     lr_vk.p_vkDeviceWaitIdle = (PFN_vkDeviceWaitIdle)vk_hw->get_device_proc_addr(vk_hw->device, "vkDeviceWaitIdle");
     lr_vk.p_vkEndCommandBuffer = (PFN_vkEndCommandBuffer)vk_hw->get_device_proc_addr(vk_hw->device, "vkEndCommandBuffer");
     lr_vk.p_vkFreeMemory = (PFN_vkFreeMemory)vk_hw->get_device_proc_addr(vk_hw->device, "vkFreeMemory");
@@ -1096,32 +1121,43 @@ static void apply_core_options(void) {
 /* ================================================================== */
 /*  Per-frame helpers                                                  */
 /* ================================================================== */
+// Report core-side supply separately from frontend/device underruns. Counts
+// describe samples available before any silence padding, not audible quality.
+static struct {
+    uint64_t calls = 0, requested = 0, supplied = 0, submitted = 0, accepted = 0;
+    uint64_t short_calls = 0, empty_calls = 0, no_driver_calls = 0;
+} s_audio_stats;
+
 static void update_audio(void) {
     if (!core_state.audio_enabled || !core_state.audio_buffer) return;
     if (!audio_mixer || !core_state.audio_batch_cb) return;
 
-    // One frame of audio a call: 800 stereo frames at 48 kHz and 60 Hz (960 at 50). Up to
-    // twice that, as before, was what a call took whenever the ring had a
-    // backlog, which it always had; RetroArch's audio sync holds a call until
-    // about what it was given has played, so every call took 33 ms - 30 calls
-    // a second while the game swapped 60 times, and a ring kept full, about a
-    // second behind (NNshi's run stats). The audio driver waits for room
-    // instead, which paces the game's audio to playback.
-    // 48000 a second over the output rate, the fraction carried over to the
-    // next call (an uncapped rate like 165 does not divide 48000)
-    static double s_sample_carry = 0.0;
-    const double exact = 48000.0 / (core_state.output_fps > 0 ? core_state.output_fps : 60.0) + s_sample_carry;
+    // Supply exactly one frontend frame, even if a guest stream has not
+    // started or temporarily runs short. Missing samples are silence; retain
+    // the source count below so padding cannot hide guest-side shortages.
+    const double exact = core_state.audio_sample_rate /
+        (core_state.output_fps > 0 ? core_state.output_fps : 60.0) + core_state.audio_sample_carry;
     const size_t frames = static_cast<size_t>(exact);
-    s_sample_carry = exact - static_cast<double>(frames);
+    core_state.audio_sample_carry = exact - static_cast<double>(frames);
     const size_t frame_samples = std::min(frames * s_audio_channels, core_state.audio_buffer_size);
-    size_t got = audio_mixer->Mix(core_state.audio_buffer, frame_samples);
-    if (got > 0 && s_audio_channels == 6)
-        s_audio_multi.batch_int16(core_state.audio_buffer, got / 6, 6,
+    size_t driver_count = 0;
+    size_t got = audio_mixer->Mix(core_state.audio_buffer, frame_samples, &driver_count);
+    auto &st = s_audio_stats;
+    ++st.calls;
+    st.requested += frame_samples / s_audio_channels;
+    st.supplied += got / s_audio_channels;
+    st.short_calls += got < frame_samples;
+    st.empty_calls += got == 0;
+    st.no_driver_calls += driver_count == 0;
+    std::fill(core_state.audio_buffer + got, core_state.audio_buffer + frame_samples, int16_t{0});
+    st.submitted += frame_samples / s_audio_channels;
+    if (s_audio_channels == 6)
+        st.accepted += s_audio_multi.batch_int16(core_state.audio_buffer, frame_samples / 6, 6,
                                   RETRO_AUDIO_SPEAKER_FRONT_LEFT | RETRO_AUDIO_SPEAKER_FRONT_RIGHT |
                                   RETRO_AUDIO_SPEAKER_FRONT_CENTER | RETRO_AUDIO_SPEAKER_LOW_FREQUENCY |
                                   RETRO_AUDIO_SPEAKER_SIDE_LEFT | RETRO_AUDIO_SPEAKER_SIDE_RIGHT);
-    else if (got > 0)
-        core_state.audio_batch_cb(core_state.audio_buffer, got / 2);
+    else
+        st.accepted += core_state.audio_batch_cb(core_state.audio_buffer, frame_samples / 2);
 }
 
 static void update_video(void) {
@@ -1146,7 +1182,8 @@ static void update_video(void) {
 }
 
 // The frame's image to RetroArch, which draws it this frame
-static void vk_hand_over(VulkanFrameResources &f, uint32_t w, uint32_t h) {
+static void vk_hand_over(VulkanFrameResources &f, uint32_t w, uint32_t h,
+                         VkSemaphore ready = VK_NULL_HANDLE) {
     vk_current_image.image_view = f.image_view;
     vk_current_image.image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     memset(&vk_current_image.create_info, 0, sizeof(vk_current_image.create_info));
@@ -1160,7 +1197,8 @@ static void vk_hand_over(VulkanFrameResources &f, uint32_t w, uint32_t h) {
                                                 VK_COMPONENT_SWIZZLE_IDENTITY};
     vk_current_image.create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    vk_hw->set_image(vk_hw->handle, &vk_current_image, 0, nullptr,
+    vk_hw->set_image(vk_hw->handle, &vk_current_image, ready ? 1 : 0,
+                     ready ? &ready : nullptr,
                      VK_QUEUE_FAMILY_IGNORED);
 
     core_state.video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
@@ -1175,29 +1213,47 @@ static void update_video_vulkan(void) {
     // Shared device: the guest output blitted straight into this frame's
     // image, GPU to GPU on the one device
     if (libretro_vk_shared_device_active()) {
-        uint32_t sync_idx = vk_hw->get_sync_index(vk_hw->handle) &
-                            vk_hw->get_sync_index_mask(vk_hw->handle);
-        if (sync_idx >= VK_MAX_SYNC) sync_idx = 0;
+        const uint32_t sync_idx = vk_hw->get_sync_index(vk_hw->handle);
+        if (sync_idx >= VK_MAX_SYNC) {
+            xenia_log(RETRO_LOG_ERROR, "Vulkan: unsupported frontend sync index %u\n", sync_idx);
+            core_state.video_cb(nullptr, 0, 0, 0);
+            return;
+        }
+        const auto slot_start = std::chrono::steady_clock::now();
         vk_hw->wait_sync_index(vk_hw->handle);
+        const auto blit_start = std::chrono::steady_clock::now();
         VulkanFrameResources &f = vk_frames[sync_idx];
         uint32_t w = 0, h = 0;
         const bool blitted =
             lr_graphics && lr_graphics->presenter() &&
             libretro_vk_blit_guest_output(
-                lr_graphics->presenter(),
-                [&f](uint32_t fw, uint32_t fh) -> VkImage {
+                lr_graphics->presenter(), sync_idx,
+                [&f](uint32_t fw, uint32_t fh,
+                     VkSemaphore& ready) -> VkImage {
                     if (f.width != fw || f.height != fh) {
                         vk_destroy_frame(f);
-                        if (!vk_create_frame(f, fw, fh)) return VK_NULL_HANDLE;
+                        if (!vk_create_frame(f, fw, fh)) {
+                            vk_destroy_frame(f);
+                            return VK_NULL_HANDLE;
+                        }
                     }
+                    ready = f.image_ready;
                     return f.image;
                 },
                 w, h);
+        const auto handoff_start = std::chrono::steady_clock::now();
         if (!blitted) {
-            core_state.video_cb(RETRO_HW_FRAME_BUFFER_VALID, 0, 0, 0);
+            // No new submission: do not ask the frontend to wait a second
+            // time on an already consumed binary semaphore.
+            core_state.video_cb(nullptr, 0, 0, 0);
             return;
         }
-        vk_hand_over(f, w, h);
+        vk_hand_over(f, w, h, f.image_ready);
+        const auto handoff_end = std::chrono::steady_clock::now();
+        s_vulkan_stats.frames++;
+        s_vulkan_stats.slot_ms += std::chrono::duration<double, std::milli>(blit_start - slot_start).count();
+        s_vulkan_stats.blit_ms += std::chrono::duration<double, std::milli>(handoff_start - blit_start).count();
+        s_vulkan_stats.handoff_ms += std::chrono::duration<double, std::milli>(handoff_end - handoff_start).count();
         return;
     }
 
@@ -1521,6 +1577,8 @@ static void xenia_sign_in(void) {
 }
 
 static bool xenia_setup_and_launch(const char *path) {
+    core_state.audio_sample_carry = 0.0;
+    s_audio_stats = {};
     try {
         namespace fs = std::filesystem;
         // Everything the emulator keeps - its storage, the content (saves,
@@ -1690,6 +1748,9 @@ static bool xenia_setup_and_launch(const char *path) {
             return false;
         }
 
+        // Register after setup's lazy statics, before starting the pause
+        // watchdog. Some hosts exit directly without retro_unload_game.
+        xenia_register_lifetime();
         game_loaded = true;
         return true;
 
@@ -1801,6 +1862,19 @@ static void xenia_shutdown(void) {
     d3d12_hw_render_active = false;
 }
 
+static void xenia_register_lifetime(void) {
+    struct EmulatorLifetime {
+        ~EmulatorLifetime() {
+            // Native application termination can bypass the Libretro unload
+            // callbacks. Join the watchdog and stop the guest before the
+            // core's global thread objects and emulator are destroyed.
+            // Frontend-owned context cleanup stays in its normal callbacks.
+            xenia_stop_emulator();
+        }
+    };
+    static EmulatorLifetime lifetime;
+}
+
 /* ================================================================== */
 /*  Libretro API (extern "C")                                          */
 /* ================================================================== */
@@ -1880,6 +1954,7 @@ RETRO_API void retro_init(void) {
     xenia_log(RETRO_LOG_INFO, "Xenia Edge libretro core %s, built from commit %s\n",
               XENIA_LIBRETRO_VERSION, XENIA_LIBRETRO_COMMIT);
     core_state.audio_sample_rate  = 48000.0;
+    core_state.audio_sample_carry = 0.0;
     core_state.audio_buffer_size  = 6 * 4096;   // int16 values (4096 frames of 5.1)
     core_state.audio_buffer       = static_cast<int16_t *>(
         calloc(core_state.audio_buffer_size, sizeof(int16_t)));
@@ -2008,13 +2083,28 @@ RETRO_API bool retro_load_game(const struct retro_game_info *info) {
         } else {
             static const struct retro_hw_render_context_negotiation_interface_vulkan negotiation = {
                 RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN,
-                RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION,
+                1,
                 xenia_vk_application_info,
                 xenia_vk_create_device,
                 xenia_vk_destroy_device,
+                nullptr,
+                nullptr,
             };
+            static auto selected_negotiation = negotiation;
+            selected_negotiation = negotiation;
+#if XE_PLATFORM_MAC
+            struct retro_hw_render_context_negotiation_interface support = {
+                RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 0};
+            if (core_state.environ_cb(
+                    RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT,
+                    &support) && support.interface_version >= 2) {
+                selected_negotiation.interface_version = 2;
+                selected_negotiation.create_instance = libretro_vk_create_instance;
+            }
+#endif
             core_state.environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE,
-                                  (void *)&negotiation);
+                                  (void *)&selected_negotiation);
+            s_vulkan_driver_notice_pending = true;
             s_launch_on_context_reset = true;
         }
     }
@@ -2074,6 +2164,8 @@ static void launch_game(void) {
     if (ok && lr_input_driver && s_rumble.set_rumble_state)
         lr_input_driver->SetRumbleCallback(s_rumble.set_rumble_state);
     if (ok) {
+        if (const char* status = libretro_vk_driver_status())
+            XELOGI("{}", status);
         pause_watchdog_start();
     } else {
         struct retro_message msg = { "Xenia could not start the game - see the log", 600 };
@@ -2176,6 +2268,26 @@ static void run_stats_end(std::chrono::steady_clock::time_point run_start, doubl
               window, (unsigned long long)st.runs, st.run_ms / st.runs, st.run_max_ms, st.gap_max_ms,
               st.video_ms / st.runs, st.video_max_ms,
               (unsigned long long)(swaps - st.swaps0), (unsigned long long)(vblanks - st.vblanks0));
+    if (s_audio_stats.calls) {
+        const auto &a = s_audio_stats;
+        xenia_log(RETRO_LOG_INFO,
+                  "[Audio stats] %llu calls: requested %llu, supplied %llu, submitted %llu, accepted %llu frames; "
+                  "short %llu, empty %llu, no driver %llu\n",
+                  (unsigned long long)a.calls, (unsigned long long)a.requested,
+                  (unsigned long long)a.supplied, (unsigned long long)a.submitted,
+                  (unsigned long long)a.accepted, (unsigned long long)a.short_calls,
+                  (unsigned long long)a.empty_calls, (unsigned long long)a.no_driver_calls);
+        s_audio_stats = {};
+    }
+    if (s_vulkan_stats.frames) {
+        const double n = double(s_vulkan_stats.frames);
+        xenia_log(RETRO_LOG_INFO,
+                  "[Vulkan stats] %llu frames: slot wait avg %.3f ms; blit submit avg %.3f ms; frontend handoff avg %.3f ms\n",
+                  (unsigned long long)s_vulkan_stats.frames,
+                  s_vulkan_stats.slot_ms / n, s_vulkan_stats.blit_ms / n,
+                  s_vulkan_stats.handoff_ms / n);
+        s_vulkan_stats = {};
+    }
     st.runs = 0;
     st.run_ms = st.run_max_ms = st.gap_max_ms = st.video_ms = st.video_max_ms = 0;
     st.swaps0 = swaps;
@@ -2184,6 +2296,14 @@ static void run_stats_end(std::chrono::steady_clock::time_point run_start, doubl
 }
 
 RETRO_API void retro_run(void) {
+    if (s_vulkan_driver_notice_pending) {
+        s_vulkan_driver_notice_pending = false;
+        if (const char* notice = libretro_vk_driver_notice()) {
+            xenia_log(RETRO_LOG_WARN, "%s\n", notice);
+            struct retro_message msg = {notice, 600};
+            core_state.environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+        }
+    }
     {
         std::string notice;
         {

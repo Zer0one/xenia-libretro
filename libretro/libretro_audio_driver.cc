@@ -227,8 +227,10 @@ void LibretroAudioSystem::Unregister(LibretroAudioDriver* driver) {
                  drivers_.end());
 }
 
-size_t LibretroAudioSystem::Mix(int16_t* out, size_t max_samples) {
+size_t LibretroAudioSystem::Mix(int16_t* out, size_t max_samples,
+                               size_t* driver_count) {
   std::lock_guard<std::mutex> lock(drivers_mutex_);
+  if (driver_count) *driver_count = drivers_.size();
   mix_.assign(max_samples, 0.0f);
   size_t longest = 0;
   for (LibretroAudioDriver* driver : drivers_) {

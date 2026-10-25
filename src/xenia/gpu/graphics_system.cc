@@ -241,8 +241,14 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
+  // Linux only sleeps, so kLowest (nice 15) would just add wake-up latency.
+#if XE_PLATFORM_LINUX
+  frame_limiter_worker_thread_->thread()->set_priority(
+      threading::ThreadPriority::kNormal);
+#else
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kLowest);
+#endif
   if (cvars::trace_gpu_stream) {
     BeginTracing();
   }
@@ -337,6 +343,8 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
       return 0x08100748;
     case XE_GPU_REG_RB_BC_CONTROL:
       return 0x0000200E;
+    case XE_GPU_REG_RB_HSIO_INTERFACE_ALIGNER_VALUE:
+      return 0x00BBBBBB;
     case XE_GPU_REG_D1MODE_V_COUNTER: {
       // Free-running scanline counter, like Xenos drives off the pixel clock.
       // Cycles 0..(total_lines-1) every frame, including the vertical-blank
@@ -391,6 +399,10 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
+      break;
+    case 0x0F01:  // RB_BC_CONTROL
+      break;
+    case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
@@ -460,6 +472,7 @@ void GraphicsSystem::InvalidateGpuMemory() {
 
 void GraphicsSystem::InitializeShaderStorage(
     const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+    std::function<void()> started_callback,
     std::function<void()> completion_callback) {
   if (!cvars::store_shaders) {
     if (completion_callback) {
@@ -471,13 +484,20 @@ void GraphicsSystem::InitializeShaderStorage(
     if (command_processor_->is_paused()) {
       // Safe to run on any thread while the command processor is paused, no
       // race condition.
+      if (started_callback) {
+        started_callback();
+      }
       command_processor_->InitializeShaderStorage(
           cache_root, title_id, true, std::move(completion_callback));
     } else {
       xe::threading::Fence fence;
       command_processor_->CallInThread(
           [this, cache_root, title_id, &fence,
+           started_callback = std::move(started_callback),
            completion_callback = std::move(completion_callback)]() mutable {
+            if (started_callback) {
+              started_callback();
+            }
             command_processor_->InitializeShaderStorage(
                 cache_root, title_id, true, std::move(completion_callback));
             fence.Signal();
@@ -487,7 +507,11 @@ void GraphicsSystem::InitializeShaderStorage(
   } else {
     command_processor_->CallInThread(
         [this, cache_root, title_id,
+         started_callback = std::move(started_callback),
          completion_callback = std::move(completion_callback)]() mutable {
+          if (started_callback) {
+            started_callback();
+          }
           command_processor_->InitializeShaderStorage(
               cache_root, title_id, false, std::move(completion_callback));
         });

@@ -250,8 +250,20 @@ void VulkanPresenter::DestroyGPUBlitResources() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
-  // No wait here: every blit is submitted through a completion timeline and
-  // awaited before CaptureGuestOutputGPUBlit returns. gpu_blit_.fence is never
+  // These submissions are made immediately by the core, without waits on
+  // frontend signals. Drain them using upstream's completion tracking before
+  // releasing command pools and source images. Completion semaphores belong
+  // to the frontend frame resources and survive an emulator reset.
+  direct_blit_completion_timeline_.AwaitAllSubmissions();
+  for (const DirectBlitResources& blit : direct_blits_) {
+    if (blit.cmd_pool) {
+      dfn.vkDestroyCommandPool(device, blit.cmd_pool, nullptr);
+    }
+  }
+  direct_blits_.clear();
+
+  // The readback path is awaited before CaptureGuestOutputGPUBlit returns.
+  // gpu_blit_.fence is never
   // submitted, so waiting on it (unsignaled, no timeout) hung every Vulkan
   // unload forever (NNshi).
   if (gpu_blit_.readback_mapped && gpu_blit_.readback_memory) {
@@ -263,7 +275,6 @@ void VulkanPresenter::DestroyGPUBlitResources() {
   if (gpu_blit_.blit_memory) dfn.vkFreeMemory(device, gpu_blit_.blit_memory, nullptr);
   if (gpu_blit_.fence) dfn.vkDestroyFence(device, gpu_blit_.fence, nullptr);
   if (gpu_blit_.cmd_pool) dfn.vkDestroyCommandPool(device, gpu_blit_.cmd_pool, nullptr);
-  if (gpu_blit_.direct_cmd_pool) dfn.vkDestroyCommandPool(device, gpu_blit_.direct_cmd_pool, nullptr);
   gpu_blit_ = {};
 }
 
@@ -489,8 +500,21 @@ bool VulkanPresenter::CaptureGuestOutputGPUBlit(const void*& data_out,
 
 #ifdef XENIA_LIBRETRO
 bool VulkanPresenter::BlitGuestOutputToImage(
-    const std::function<VkImage(uint32_t width, uint32_t height)>& target_for,
+    uint32_t sync_index, bool wait_for_completion,
+    const std::function<VkImage(uint32_t width, uint32_t height,
+                                VkSemaphore& ready_semaphore)>& target_for,
     uint32_t& width_out, uint32_t& height_out) {
+  if (direct_blits_.size() <= sync_index) {
+    direct_blits_.resize(size_t(sync_index) + 1);
+  }
+  DirectBlitResources& blit = direct_blits_[sync_index];
+  // The caller has waited for the frontend slot. Track our submission too,
+  // including paths where the frontend didn't consume the submitted image.
+  if (!direct_blit_completion_timeline_.AwaitSubmissionAndUpdateCompleted(
+          blit.submission)) {
+    return false;
+  }
+  blit.source.reset();
   std::shared_ptr<GuestOutputImage> guest_output_image;
   {
     uint32_t guest_output_mailbox_index;
@@ -509,36 +533,41 @@ bool VulkanPresenter::BlitGuestOutputToImage(
   if (!w || !h) {
     return false;
   }
-  const VkImage target = target_for(w, h);
-  if (target == VK_NULL_HANDLE) {
+  VkSemaphore ready_semaphore = VK_NULL_HANDLE;
+  const VkImage target = target_for(w, h, ready_semaphore);
+  if (target == VK_NULL_HANDLE || ready_semaphore == VK_NULL_HANDLE) {
     return false;
   }
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  if (gpu_blit_.direct_cmd_pool == VK_NULL_HANDLE) {
+  if (blit.cmd_pool == VK_NULL_HANDLE) {
     VkCommandPoolCreateInfo pool_info = {
         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     pool_info.queueFamilyIndex =
         vulkan_device_->queue_family_graphics_compute();
     if (dfn.vkCreateCommandPool(device, &pool_info, nullptr,
-                                &gpu_blit_.direct_cmd_pool) != VK_SUCCESS) {
-      gpu_blit_.direct_cmd_pool = VK_NULL_HANDLE;
+                                &blit.cmd_pool) != VK_SUCCESS) {
+      blit.cmd_pool = VK_NULL_HANDLE;
       return false;
     }
     VkCommandBufferAllocateInfo alloc_info = {
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    alloc_info.commandPool = gpu_blit_.direct_cmd_pool;
+    alloc_info.commandPool = blit.cmd_pool;
     alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandBufferCount = 1;
     if (dfn.vkAllocateCommandBuffers(device, &alloc_info,
-                                     &gpu_blit_.direct_cmd) != VK_SUCCESS) {
+                                     &blit.cmd) != VK_SUCCESS) {
+      dfn.vkDestroyCommandPool(device, blit.cmd_pool, nullptr);
+      blit.cmd_pool = VK_NULL_HANDLE;
       return false;
     }
   }
-  const VkCommandBuffer cmd = gpu_blit_.direct_cmd;
-  dfn.vkResetCommandPool(device, gpu_blit_.direct_cmd_pool, 0);
+  const VkCommandBuffer cmd = blit.cmd;
+  if (dfn.vkResetCommandPool(device, blit.cmd_pool, 0) != VK_SUCCESS) {
+    return false;
+  }
   VkCommandBufferBeginInfo begin_info = {
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -598,20 +627,27 @@ bool VulkanPresenter::BlitGuestOutputToImage(
   if (dfn.vkEndCommandBuffer(cmd) != VK_SUCCESS) {
     return false;
   }
-  {
-    // Awaited when the timeline goes: the frontend draws the image in this
-    // same retro_run, on its own queue
-    VulkanGPUCompletionTimeline completion_timeline(vulkan_device_);
-    VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &cmd;
-    const VkResult submit_result = completion_timeline.AcquireFenceAndSubmit(
-        vulkan_device_->queue_family_graphics_compute(), 0, 1, &submit_info);
-    if (submit_result != VK_SUCCESS) {
-      XELOGE("VulkanPresenter: Failed to submit the guest output blit: {}",
-             vk::to_string(vk::Result(submit_result)));
-      return false;
-    }
+  VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &cmd;
+  submit_info.signalSemaphoreCount = 1;
+  submit_info.pSignalSemaphores = &ready_semaphore;
+  const uint64_t submission =
+      direct_blit_completion_timeline_.GetUpcomingSubmission();
+  const VkResult submit_result =
+      direct_blit_completion_timeline_.AcquireFenceAndSubmit(
+          vulkan_device_->queue_family_graphics_compute(), 0, 1, &submit_info);
+  if (submit_result != VK_SUCCESS) {
+    XELOGE("VulkanPresenter: Failed to submit the guest output blit: {}",
+           vk::to_string(vk::Result(submit_result)));
+    return false;
+  }
+  blit.submission = submission;
+  blit.source = std::move(guest_output_image);
+  if (wait_for_completion &&
+      !direct_blit_completion_timeline_.AwaitSubmissionAndUpdateCompleted(
+          submission)) {
+    return false;
   }
   width_out = w;
   height_out = h;

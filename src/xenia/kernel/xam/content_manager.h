@@ -38,6 +38,10 @@ namespace xam {
 // TODO: check if actual x360 kernel/xam has a value similar to this
 constexpr uint32_t kCurrentlyRunningTitleId = 0xFFFFFFFF;
 
+// This bit of a content file name's first byte marks content shared under XUID
+// 0, stored under the name without it.
+constexpr uint8_t kSharedContentFileNameBit = 0x80;
+
 struct XCONTENT_DATA {
   be<uint32_t> device_id;         // 0x0 sz:0x4
   be<XContentType> content_type;  // 0x4 sz:0x4
@@ -217,10 +221,13 @@ class ContentPackage {
   // Ends in a separator, so it prefixes only this package's entries.
   const std::string& device_path() const { return device_path_; }
 
+  const std::filesystem::path& package_path() const { return package_path_; }
+
  private:
   KernelState* kernel_state_;
   std::string root_name_;
   std::string device_path_;
+  std::filesystem::path package_path_;
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_;
   bool mounted_ = false;
@@ -244,15 +251,24 @@ class ContentManager {
       const std::string_view root_name, const uint64_t xuid,
       const XCONTENT_AGGREGATE_DATA& data, const uint32_t disc_number = -1);
 
+  // What any request for the content fails with because of its file name.
+  X_RESULT CheckPackageName(const uint64_t xuid,
+                            const XCONTENT_AGGREGATE_DATA& data);
   bool ContentExists(const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT WriteContentHeaderFile(const uint64_t xuid,
                                   XCONTENT_AGGREGATE_DATA data);
-  X_RESULT ReadContentHeaderFile(const std::string_view file_name,
+  X_RESULT ReadContentHeaderFile(const std::filesystem::path& package_path,
                                  const uint64_t xuid, const uint32_t title_id,
                                  XContentType content_type,
                                  XCONTENT_AGGREGATE_DATA& data) const;
+  // Makes the package without mounting it.
+  X_RESULT CreatePackage(const uint64_t xuid,
+                         const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT CreateContent(const std::string_view root_name, const uint64_t xuid,
                          const XCONTENT_AGGREGATE_DATA& data);
+  // Empties the package but for its thumbnail.
+  X_RESULT TruncateContent(const uint64_t xuid,
+                           const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT OpenContent(const std::string_view root_name, const uint64_t xuid,
                        const XCONTENT_AGGREGATE_DATA& data,
                        uint32_t& content_license,
@@ -267,7 +283,7 @@ class ContentManager {
   X_RESULT DeleteContent(const uint64_t xuid,
                          const XCONTENT_AGGREGATE_DATA& data);
   std::filesystem::path ResolveGameUserContentPath(const uint64_t xuid);
-  bool IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const;
+  bool IsContentOpen(const std::filesystem::path& package_path) const;
   void CloseOpenedFilesFromContent(const ContentPackage& package);
 
   uint64_t GetContentTotalSpace() const;
@@ -277,11 +293,11 @@ class ContentManager {
   std::filesystem::path ResolvePackageRoot(
       const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
-  std::filesystem::path ResolvePackagePath(const uint64_t xuid,
-                                           const XCONTENT_AGGREGATE_DATA& data);
-  std::filesystem::path ResolvePackageHeaderPath(
-      const std::string_view file_name, uint64_t xuid, uint32_t title_id,
-      const XContentType content_type) const;
+  // X_ERROR_INVALID_NAME for a file name the file system refuses and
+  // X_ERROR_PATH_NOT_FOUND for one that names no package.
+  X_RESULT ResolvePackagePath(const uint64_t xuid,
+                              const XCONTENT_AGGREGATE_DATA& data,
+                              std::filesystem::path& path);
 
   std::unordered_set<uint32_t> FindPublisherTitleIds(
       const uint64_t xuid,

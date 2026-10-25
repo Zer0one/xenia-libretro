@@ -12,7 +12,7 @@ on:
         type: string
         default: all
   push:
-    branches: [libretro]
+    branches: [main]
     paths-ignore:
       - '*.md'
       - 'LICENSE'

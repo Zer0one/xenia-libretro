@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xam/content_manager.h"
 
+#include <algorithm>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -39,14 +41,15 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
                                const std::string_view root_path)
     : kernel_state_(kernel_state),
       root_name_(root_name),
+      package_path_(package_path),
       license_(cvars::license_mask) {
   device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
   if (std::filesystem::is_directory(package_path)) {
-    auto device = std::make_unique<vfs::HostPathDevice>(device_path_,
-                                                        package_path, false);
+    auto device = std::make_unique<vfs::HostPathDevice>(
+        device_path_, package_path, false, false, "STFS");
     mounted_ = device->Initialize();
     fs->RegisterDevice(std::move(device));
   } else {
@@ -59,7 +62,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
       mounted_ = true;
       fs->RegisterDevice(std::move(device));
     } else {
-      XELOGE("{}: Cannot mount content container {}", __func__, package_path);
+      XELOGE("{}: Cannot mount content container {}", __func__,
+             xe::strip_pii(xe::path_to_utf8(package_path)));
     }
   }
   fs->RegisterSymbolicLink(root_name_ + ":",
@@ -74,6 +78,12 @@ ContentPackage::~ContentPackage() {
 
 void ContentPackage::LoadPackageLicenseMask(
     const std::filesystem::path header_path) {
+  auto header = vfs::XContentContainerDevice::ReadContainerHeader(header_path);
+  if (header && header->content_header.is_magic_valid()) {
+    license_ = vfs::XContentContainerDevice::LicenseMaskFromHeader(*header);
+    return;
+  }
+
   if (!std::filesystem::exists(header_path)) {
     return;
   }
@@ -125,8 +135,59 @@ static std::filesystem::path ResolveNameInsensitive(
   return {};
 }
 
-std::filesystem::path ContentManager::ResolvePackagePath(
-    const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+// The error a package's file name fails with in FATX, if any.
+static X_RESULT CheckFileName(const std::string_view name) {
+  // FATX refuses "." and ".." and these characters in any component.
+  constexpr std::string_view kInvalidCharacters = "\"*+,/:;<=>?|";
+  size_t component_start = 0;
+  for (size_t i = 0; i <= name.size(); ++i) {
+    if (i < name.size() && name[i] != '\\') {
+      if (uint8_t(name[i]) < 0x20 ||
+          kInvalidCharacters.find(name[i]) != std::string_view::npos) {
+        return X_ERROR_INVALID_NAME;
+      }
+      continue;
+    }
+    const std::string_view component =
+        name.substr(component_start, i - component_start);
+    if (component == "." || component == "..") {
+      return X_ERROR_INVALID_NAME;
+    }
+    component_start = i + 1;
+  }
+  // A package is a file in FATX so a name with a separator in it names none.
+  // Only the first byte may be non-ASCII so a name with any other doesn't
+  // either.
+  if (name.empty() || name.find('\\') != std::string_view::npos ||
+      std::any_of(name.begin(), name.end(),
+                  [](const char c) { return uint8_t(c) >= 0x80; })) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::ResolvePackagePath(const uint64_t xuid,
+                                            const XCONTENT_AGGREGATE_DATA& data,
+                                            std::filesystem::path& path) {
+  std::string file_name = data.file_name();
+  const bool shared =
+      !file_name.empty() && (uint8_t(file_name[0]) & kSharedContentFileNameBit);
+  if (shared) {
+    file_name[0] = char(uint8_t(file_name[0]) & ~kSharedContentFileNameBit);
+  }
+  file_name = xe::string_util::trim(file_name);
+  if (const X_RESULT result = CheckFileName(file_name)) {
+    return result;
+  }
+  // The host has to keep the name as it is, which Windows doesn't for one
+  // ending in a dot.
+  const std::filesystem::path folder_name = xe::to_path(file_name);
+  std::error_code ec;
+  if (std::filesystem::absolute(root_path_ / folder_name, ec) !=
+      std::filesystem::absolute(root_path_, ec) / folder_name) {
+    return X_ERROR_INVALID_NAME;
+  }
+
   // Content path:
   // content_root/title_id/content_type/data_file_name/
   auto get_package_path = [&, data](const uint32_t title_id) {
@@ -135,17 +196,16 @@ std::filesystem::path ContentManager::ResolvePackagePath(
 
     // All DLCs are stored in common directory, so we need to override xuid for
     // them and probably some other types.
-    if (data.content_type == XContentType::kMarketplaceContent) {
+    if (shared || data.content_type == XContentType::kMarketplaceContent) {
       used_xuid = 0;
     }
 
     auto package_root =
         ResolvePackageRoot(used_xuid, title_id, data.content_type);
-    std::string final_name = xe::string_util::trim(data.file_name());
-    std::filesystem::path package_path = package_root / xe::to_path(final_name);
+    std::filesystem::path package_path = package_root / folder_name;
 
     if (!std::filesystem::exists(package_path)) {
-      auto existing = ResolveNameInsensitive(package_root, final_name);
+      auto existing = ResolveNameInsensitive(package_root, file_name);
       if (!existing.empty()) {
         package_path = existing;
       }
@@ -164,35 +224,30 @@ std::filesystem::path ContentManager::ResolvePackagePath(
       if (!std::filesystem::exists(package_path)) {
         continue;
       }
-      return package_path;
+      path = package_path;
+      return X_ERROR_SUCCESS;
     }
   }
 
   // Default handling for current title
-  return get_package_path(data.title_id);
+  path = get_package_path(data.title_id);
+  return X_ERROR_SUCCESS;
 }
 
-std::filesystem::path ContentManager::ResolvePackageHeaderPath(
-    const std::string_view file_name, uint64_t xuid, uint32_t title_id,
-    const XContentType content_type) const {
-  if (title_id == kCurrentlyRunningTitleId) {
-    title_id = kernel_state_->title_id();
-  }
+X_RESULT ContentManager::CheckPackageName(const uint64_t xuid,
+                                          const XCONTENT_AGGREGATE_DATA& data) {
+  std::filesystem::path path;
+  return ResolvePackagePath(xuid, data, path);
+}
 
-  if (content_type == XContentType::kMarketplaceContent) {
-    xuid = 0;
-  }
-
-  auto xuid_str = fmt::format("{:016X}", xuid);
-  auto title_id_str = fmt::format("{:08X}", title_id);
-  auto content_type_str = fmt::format("{:08X}", uint32_t(content_type));
-  std::string final_name =
-      xe::string_util::trim(std::string(file_name)) + ".header";
-
-  // Header root path:
-  // content_root/xuid/title_id/Headers/content_type/
-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName /
-         content_type_str / final_name;
+static std::filesystem::path PackageHeaderPath(
+    const std::filesystem::path& package_path) {
+  // Header path:
+  // content_root/xuid/title_id/Headers/content_type/package_name.header
+  const auto content_type_path = package_path.parent_path();
+  return content_type_path.parent_path() / kGameContentHeaderDirName /
+         content_type_path.filename() /
+         package_path.filename().concat(".header");
 }
 
 std::unordered_set<uint32_t> ContentManager::FindPublisherTitleIds(
@@ -249,7 +304,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
 
     for (const auto& file_info : file_infos) {
       XCONTENT_AGGREGATE_DATA content_data;
-      if (XSUCCEEDED(ReadContentHeaderFile(xe::path_to_utf8(file_info.name),
+      if (XSUCCEEDED(ReadContentHeaderFile(file_info.path / file_info.name,
                                            xuid, title_id, content_type,
                                            content_data))) {
         result.emplace_back(std::move(content_data));
@@ -324,8 +379,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContentODD(
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, const uint64_t xuid,
     const XCONTENT_AGGREGATE_DATA& data, const uint32_t disc_number) {
-  auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  std::filesystem::path package_path;
+  if (ResolvePackagePath(xuid, data, package_path) ||
+      !std::filesystem::exists(package_path)) {
     return nullptr;
   }
 
@@ -346,8 +402,8 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 
 bool ContentManager::ContentExists(const uint64_t xuid,
                                    const XCONTENT_AGGREGATE_DATA& data) {
-  auto path = ResolvePackagePath(xuid, data);
-  return std::filesystem::exists(path);
+  std::filesystem::path path;
+  return !ResolvePackagePath(xuid, data, path) && std::filesystem::exists(path);
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
@@ -358,11 +414,15 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
   if (data.xuid == -1) {
     data.xuid = xuid;
   }
-  uint64_t used_xuid =
-      (data.xuid != -1 && data.xuid != 0) ? data.xuid.get() : xuid;
 
-  auto header_path = ResolvePackageHeaderPath(data.file_name(), used_xuid,
-                                              data.title_id, data.content_type);
+  std::filesystem::path package_path;
+  if (ResolvePackagePath(xuid, data, package_path)) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
+  // The header names the package as it's stored.
+  data.file_name_raw[0] =
+      char(uint8_t(data.file_name_raw[0]) & ~kSharedContentFileNameBit);
+  auto header_path = PackageHeaderPath(package_path);
   auto parent_path = header_path.parent_path();
 
   if (!std::filesystem::exists(parent_path)) {
@@ -383,15 +443,40 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
 }
 
 X_RESULT ContentManager::ReadContentHeaderFile(
-    const std::string_view file_name, const uint64_t xuid,
+    const std::filesystem::path& package_path, const uint64_t xuid,
     const uint32_t title_id, XContentType content_type,
     XCONTENT_AGGREGATE_DATA& data) const {
-  auto header_file_path =
-      ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
+  auto header_file_path = PackageHeaderPath(package_path);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
   if (std::filesystem::exists(header_file_path)) {
     auto file = xe::filesystem::OpenFile(header_file_path, "rb");
+    if (!file) {
+      return X_STATUS_NO_SUCH_FILE;
+    }
+
+    // Upstream canary rewrites the header file as the whole container header,
+    // followed by the file name the save was created with.
+    auto header = vfs::XContentContainerDevice::ReadContainerHeader(file);
+    if (header && header->content_header.is_magic_valid()) {
+      char saved_name[sizeof(XCONTENT_DATA::file_name_raw)] = {};
+      fread(saved_name, 1, sizeof(saved_name), file);
+      fclose(file);
+      data = vfs::XContentContainerDevice::ContentDataFromHeader(*header);
+      // Identify the package by its location, as listing without a header does.
+      data.content_type = content_type;
+      data.title_id = title_id;
+      data.xuid = xuid;
+      const std::string file_name = xe::path_to_utf8(package_path.filename());
+      // Only a save has its name there, an extracted package has other data.
+      data.set_file_name(
+          content_type == XContentType::kSavedGame && saved_name[0]
+              ? std::string_view(saved_name,
+                                 strnlen(saved_name, sizeof(saved_name)))
+              : std::string_view(file_name));
+      return X_STATUS_SUCCESS;
+    }
+    fseek(file, 0, SEEK_SET);
 
     std::array<uint8_t, header_size> buffer;
 
@@ -414,6 +499,25 @@ X_RESULT ContentManager::ReadContentHeaderFile(
   return X_STATUS_NO_SUCH_FILE;
 }
 
+X_RESULT ContentManager::CreatePackage(const uint64_t xuid,
+                                       const XCONTENT_AGGREGATE_DATA& data) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
+  if (std::filesystem::exists(package_path)) {
+    // Exists, must not!
+    return X_ERROR_ALREADY_EXISTS;
+  }
+
+  if (!std::filesystem::create_directories(package_path)) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  return X_ERROR_SUCCESS;
+}
+
 X_RESULT ContentManager::CreateContent(const std::string_view root_name,
                                        const uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
@@ -424,14 +528,8 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
     return X_ERROR_ALREADY_EXISTS;
   }
 
-  auto package_path = ResolvePackagePath(xuid, data);
-  if (std::filesystem::exists(package_path)) {
-    // Exists, must not!
-    return X_ERROR_ALREADY_EXISTS;
-  }
-
-  if (!std::filesystem::create_directories(package_path)) {
-    return X_ERROR_ACCESS_DENIED;
+  if (const X_RESULT result = CreatePackage(xuid, data)) {
+    return result;
   }
 
   auto package = ResolvePackage(root_name, xuid, data);
@@ -457,7 +555,10 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
     return X_ERROR_ALREADY_EXISTS;
   }
 
-  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
   if (!std::filesystem::exists(package_path)) {
     // Does not exist, must be created.
     return X_ERROR_FILE_NOT_FOUND;
@@ -469,8 +570,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+  package->LoadPackageLicenseMask(PackageHeaderPath(package_path));
 
   content_license = package->GetPackageLicense();
   if (static_cast<uint32_t>(cvars::license_mask) > 0) {
@@ -515,7 +615,10 @@ X_RESULT ContentManager::GetContentThumbnail(
     std::vector<uint8_t>* buffer) {
   auto global_lock = global_critical_region_.Acquire();
 
-  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
   auto thumb_path = package_path / vfs::kPackageThumbnailFileName;
   if (std::filesystem::exists(thumb_path)) {
     auto file = xe::filesystem::OpenFile(thumb_path, "rb");
@@ -524,42 +627,106 @@ X_RESULT ContentManager::GetContentThumbnail(
     fread(const_cast<uint8_t*>(buffer->data()), 1, buffer->size(), file);
     fclose(file);
     return X_ERROR_SUCCESS;
-  } else {
+  }
+
+  // A deleted package leaves its header behind.
+  if (!std::filesystem::exists(package_path)) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+
+  // Upstream canary moves the thumbnail into the header file.
+  auto header = vfs::XContentContainerDevice::ReadContainerHeader(
+      PackageHeaderPath(package_path));
+  if (!header || !header->content_header.is_magic_valid()) {
     return X_ERROR_FILE_NOT_FOUND;
   }
+  const auto& metadata = header->content_metadata;
+  const uint32_t max_thumbnail_size =
+      metadata.metadata_version >= 2 ? vfs::XContentMetadata::kThumbLengthV2
+                                     : vfs::XContentMetadata::kThumbLengthV1;
+  if (metadata.thumbnail_size == 0 ||
+      metadata.thumbnail_size > max_thumbnail_size) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  buffer->assign(metadata.thumbnail,
+                 metadata.thumbnail + metadata.thumbnail_size);
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT ContentManager::SetContentThumbnail(
     const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
     std::vector<uint8_t> buffer) {
   auto global_lock = global_critical_region_.Acquire();
-  auto package_path = ResolvePackagePath(xuid, data);
-  std::filesystem::create_directories(package_path);
-  if (std::filesystem::exists(package_path)) {
-    auto thumb_path = package_path / vfs::kPackageThumbnailFileName;
-    auto file = xe::filesystem::OpenFile(thumb_path, "wb");
-    fwrite(buffer.data(), 1, buffer.size(), file);
-    fclose(file);
-    return X_ERROR_SUCCESS;
-  } else {
-    return X_ERROR_FILE_NOT_FOUND;
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
   }
+  if (!std::filesystem::exists(package_path)) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  auto file = xe::filesystem::OpenFile(
+      package_path / vfs::kPackageThumbnailFileName, "wb");
+  if (!file) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  fwrite(buffer.data(), 1, buffer.size(), file);
+  fclose(file);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::TruncateContent(const uint64_t xuid,
+                                         const XCONTENT_AGGREGATE_DATA& data) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
+  if (IsContentOpen(package_path)) {
+    return X_ERROR_SHARING_VIOLATION;
+  }
+  std::error_code ec;
+  // A package stored as a container file becomes an empty directory.
+  if (!std::filesystem::is_directory(package_path, ec)) {
+    if (!std::filesystem::remove(package_path, ec) ||
+        !std::filesystem::create_directory(package_path, ec)) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+    return X_ERROR_SUCCESS;
+  }
+  std::vector<std::filesystem::path> entries;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(package_path, ec)) {
+    if (entry.path().filename() != vfs::kPackageThumbnailFileName) {
+      entries.push_back(entry.path());
+    }
+  }
+  if (ec) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  for (const auto& entry : entries) {
+    if (std::filesystem::remove_all(entry, ec) == static_cast<uintmax_t>(-1)) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT ContentManager::DeleteContent(const uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
   auto global_lock = global_critical_region_.Acquire();
 
-  if (IsContentOpen(data)) {
-    // TODO(Gliniak): Get real error code for this case.
-    return X_ERROR_ACCESS_DENIED;
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
   }
-
-  auto package_path = ResolvePackagePath(xuid, data);
+  if (IsContentOpen(package_path)) {
+    return X_ERROR_SHARING_VIOLATION;
+  }
   if (std::filesystem::remove_all(package_path) > 0) {
     return X_ERROR_SUCCESS;
   } else {
-    return X_ERROR_FILE_NOT_FOUND;
+    return X_ERROR_PATH_NOT_FOUND;
   }
 }
 
@@ -572,12 +739,15 @@ std::filesystem::path ContentManager::ResolveGameUserContentPath(
          title_id;
 }
 
-bool ContentManager::IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const {
-  return std::ranges::any_of(
-      open_packages_,
-      [data](std::pair<string_key_insensitive, ContentPackage*> content) {
-        return data == content.second->GetPackageContentData();
-      });
+bool ContentManager::IsContentOpen(
+    const std::filesystem::path& package_path) const {
+  // A name in another case, with the shared bit or for another user can reach
+  // the same package so open ones are matched by their host files.
+  return std::ranges::any_of(open_packages_, [&](const auto& content) {
+    std::error_code ec;
+    return std::filesystem::equivalent(package_path,
+                                       content.second->package_path(), ec);
+  });
 }
 
 void ContentManager::CloseOpenedFilesFromContent(

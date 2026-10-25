@@ -114,7 +114,8 @@ class LibretroAudioSystem : public AudioSystem {
   // Mixes every driver's queued audio into `out` (interleaved int16 in the
   // output's channels),
   // at most `max_samples` samples; returns how many it wrote.
-  size_t Mix(int16_t* out, size_t max_samples);
+  // Optionally reports the registered driver count in the same locked snapshot.
+  size_t Mix(int16_t* out, size_t max_samples, size_t* driver_count = nullptr);
 
   void Register(LibretroAudioDriver* driver);
   void Unregister(LibretroAudioDriver* driver);

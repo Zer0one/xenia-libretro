@@ -9,6 +9,7 @@
 
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/base/utf8.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/info/volume.h"
@@ -252,7 +253,7 @@ dword_result_t NtSetInformationFile_entry(
         return X_STATUS_INVALID_PARAMETER;
       }
 
-      file->Rename(target_path);
+      result = file->Rename(target_path, info->replace_existing != 0);
       out_length = sizeof(*info);
       break;
     }
@@ -273,13 +274,34 @@ dword_result_t NtSetInformationFile_entry(
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
-      result = file->SetLength(info->allocation_size);
       out_length = sizeof(*info);
-
-      // Update the files vfs::Entry information
+      if (!(file->file_access() &
+            (xe::filesystem::FileAccess::kGenericWrite |
+             xe::filesystem::FileAccess::kFileWriteData))) {
+        result = X_STATUS_ACCESS_DENIED;
+        break;
+      }
+      // The allocation rounds up to whole allocation units. A larger one
+      // leaves the file size alone. A smaller one cuts the file to it.
+      auto device = file->device();
+      uint64_t allocation_size =
+          xe::round_up(uint64_t(info->allocation_size),
+                       uint64_t(device->sectors_per_allocation_unit()) *
+                           device->bytes_per_sector(),
+                       false);
+      uint64_t file_size = 0;
       kernel_state()->RunBlockingIo(
-          [&]() { file->entry()->update(); },
+          [&]() {
+            file->entry()->update();
+            file_size = file->entry()->size();
+          },
           GuestScheduler::BlockingCallClass::kConcurrent);
+      if (allocation_size < file_size) {
+        result = file->SetLength(allocation_size);
+        kernel_state()->RunBlockingIo(
+            [&]() { file->entry()->update(); },
+            GuestScheduler::BlockingCallClass::kConcurrent);
+      }
       break;
     }
     case XFileEndOfFileInformation: {
@@ -301,10 +323,13 @@ dword_result_t NtSetInformationFile_entry(
       out_length = sizeof(*info);
       auto port =
           kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
-      if (!port) {
+      // Only an async handle binds to a port. It binds once.
+      if (file->is_synchronous() || file->HasCompletionPort()) {
+        result = X_STATUS_INVALID_PARAMETER;
+      } else if (!port) {
         result = X_STATUS_INVALID_HANDLE;
-      } else {
-        file->RegisterIOCompletionPort(key, port);
+      } else if (!file->RegisterIOCompletionPort(key, port)) {
+        result = X_STATUS_INVALID_PARAMETER;
       }
       break;
     }
