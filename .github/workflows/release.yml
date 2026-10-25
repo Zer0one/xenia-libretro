@@ -25,6 +25,8 @@ jobs:
     name: Build And Package macOS ARM64
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +44,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify Pinned C++ Toolchain
+        shell: bash
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          clang++ --version
+          cat > "$RUNNER_TEMP/jthread-probe.cc" <<'CPP'
+          #include <thread>
+          #include <stop_token>
+          int main() {
+            std::jthread worker([](std::stop_token) {});
+            worker.request_stop();
+            worker.join();
+          }
+          CPP
+          clang++ -std=c++20 -mmacosx-version-min=15.0 "$RUNNER_TEMP/jthread-probe.cc" -o "$RUNNER_TEMP/jthread-probe"
+          "$RUNNER_TEMP/jthread-probe"
       - name: Validate Source Tag
         shell: bash
         run: |
