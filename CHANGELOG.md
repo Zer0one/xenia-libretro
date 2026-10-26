@@ -8,6 +8,8 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## 0.1.0.2 - 26 October 2026
 
+- Publish and verify all eight CI assets for the six-target matrix already in progress before the later Android exclusion policy. The installed macOS core/info match the downloaded package; native API/version and signature checks pass. Windows succeeds on an identical-source retry after the first Slang shader compile failure.
+
 - Merge Xenia Edge `d881a29` in full: improve Xenos shader arithmetic/rounding, fixed-point blending, float16 formats, Vulkan depth bias and converted index-buffer sizing; update Mesa. These are upstream rendering/correctness changes, without a measured performance claim.
 - Integrate upstream guest-memory protection and page-table flush corrections, file rename/information and timer/APC fixes, XAM/NUI/user-service behavior, music playback cleanup/settings and raw-Ethernet System Link APIs. Multiplayer and physical Kinect support are not established by this merge.
 - Adapt the Libretro audio adapter to upstream's shared driver destruction, clear queued RetroPad keystrokes on title launch, and keep new assertion/disc-error paths headless. Frontend audio-block sizing, vblank pacing, Vulkan handoff and existing shutdown paths are preserved.
