@@ -26,6 +26,7 @@ src/xenia/hid/keyboard
 src/xenia/hid/sdl
 src/xenia/kernel/testing
 src/xenia/kernel/xam/testing
+src/xenia/kernel/xboxkrnl/testing
 src/xenia/net/testing
 src/xenia/tools
 src/xenia/ui/advanced_settings_dialog_wx.cc

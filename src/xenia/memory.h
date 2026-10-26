@@ -761,8 +761,12 @@ class Memory {
   // Claims the address space user mode code runs in, which starts empty.
   bool EnableUserModeViews();
 
-  // Drops every page mapped through the page table, which flushing the TB does.
+  // Drops every page mapped through the page table, which flushing the entire
+  // TB does.
   void FlushUserPageTable();
+  // Drops the pages mapped through the page table whose entries changed since
+  // they were mapped, which flushing the user mode TB does.
+  void FlushChangedUserPages();
 
   // Base of the user mode address space, null until it is created.
   inline uint8_t* user_virtual_membase() const {
@@ -876,6 +880,12 @@ class Memory {
   bool SplitUserPage(uint32_t index);
   // Maps one 4 KB piece of a split page. Under the lock.
   bool MapUserPiece(uint32_t piece, bool allow_fallback);
+  // Unmaps user mode page |index| and forgets what its pieces showed. Under
+  // the lock.
+  void ReleaseUserPage(uint32_t index);
+  // The descriptor and table words the translation of |piece| reads: kind,
+  // table frame and entry. Under the lock.
+  uint64_t UserPieceTableKey(uint32_t piece);
   // Records the physical memory |count| user mode pieces from |first_piece|
   // show. Under the lock.
   void TrackUserPieces(uint32_t first_piece, uint32_t count,
@@ -886,8 +896,8 @@ class Memory {
   // changed bit, and the write watch on the physical page it shows. Under the
   // lock.
   xe::memory::PageAccess UserPieceAccess(uint32_t piece) const;
-  // Protects |count| pieces from |first_piece|, mapped read-write, to their
-  // UserPieceAccess. Under the lock.
+  // Protects |count| pieces from |first_piece| to their UserPieceAccess,
+  // read-write ones included. Under the lock.
   void ProtectUserPieces(uint32_t first_piece, uint32_t count);
   // Write protects the range's physical pages in every user mode page that
   // shows them. Takes the lock.
@@ -1013,6 +1023,9 @@ class Memory {
   // The PageAccess each piece's entry allows user mode, read-write where no
   // entry applies.
   std::vector<uint8_t> user_piece_access_;
+  // The UserPieceTableKey of each piece when it was mapped, or UINT64_MAX to
+  // drop it at the next flush.
+  std::vector<uint64_t> user_piece_table_key_;
   // The user mode pieces showing a page in each physical 64 KB block.
   std::vector<std::vector<uint32_t>> user_block_pieces_;
   // A bit per physical 4 KB page whose next user mode write is reported.

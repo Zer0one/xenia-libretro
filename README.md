@@ -2,7 +2,7 @@
 
 A [libretro](https://www.libretro.com/) core of [Xenia Edge](https://github.com/has207/xenia-edge), the Xbox 360 emulator, for RetroArch and other libretro frontends.
 
-The emulator is upstream's: this repository follows xenia-edge and adds the libretro frontend in `libretro/`. It holds the core only; upstream's standalone UI, packaging and CI are not part of it (the paths are listed in `.upstream-excluded`). The version the core reports is upstream's, with the upstream commit it is merged to (`upstream.version`). The current source integrates xenia-edge commit eb31a60 of 23 October 2026. See [Roadmap](ROADMAP.md) for validation status and planned work.
+The emulator is upstream's: this repository follows xenia-edge and adds the libretro frontend in `libretro/`. It holds the core only; upstream's standalone UI, packaging and CI are not part of it (the paths are listed in `.upstream-excluded`). The version the core reports is upstream's, with the upstream commit it is merged to (`upstream.version`). The current source integrates xenia-edge commit d881a29 (full merge through 26 October 2026). See [Roadmap](ROADMAP.md) for validation status and planned work.
 
 ## Downloads
 

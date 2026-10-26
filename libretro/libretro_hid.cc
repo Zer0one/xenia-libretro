@@ -73,6 +73,13 @@ LibretroInputDriver::~LibretroInputDriver() = default;
 
 X_STATUS LibretroInputDriver::Setup() { return X_STATUS_SUCCESS; }
 
+void LibretroInputDriver::ResetKeystrokes() {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  for (auto& state : keystrokes_) {
+    state = {};
+  }
+}
+
 InputType LibretroInputDriver::GetInputType() const {
   return InputType::Controller;
 }

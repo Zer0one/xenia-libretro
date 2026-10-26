@@ -212,6 +212,8 @@ SpirvShaderTranslator::Features::Features(
           vulkan_device->properties().shaderDenormFlushToZeroFloat32),
       rounding_mode_rte_float32(
           vulkan_device->properties().shaderRoundingModeRTEFloat32),
+      rounding_mode_rtz_float32(
+          vulkan_device->properties().shaderRoundingModeRTZFloat32),
       fragment_shader_sample_interlock(
           vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(
@@ -360,6 +362,7 @@ void SpirvShaderTranslator::Reset() {
   bisect_current_instruction_ = UINT32_MAX;
   bisect_snapshot_emitted_ = false;
   var_main_bisect_snapshot_ = spv::NoResult;
+  var_main_estimate_coefficients_.fill(spv::NoResult);
   var_main_registers_ = spv::NoResult;
   main_interpolators_unmodified_ = 0;
   var_main_interpolator_guest_center_deltas_.fill(spv::NoResult);
@@ -510,7 +513,7 @@ void SpirvShaderTranslator::StartTranslation() {
   if (features_.spirv_version < spv::Spv_1_4) {
     if (features_.signed_zero_inf_nan_preserve_float32 ||
         features_.denorm_flush_to_zero_float32 ||
-        features_.rounding_mode_rte_float32) {
+        features_.rounding_mode_rte_float32 || RoundsTowardZeroInHardware()) {
       builder_->addExtension("SPV_KHR_float_controls");
     }
   }
@@ -1319,8 +1322,12 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     builder_->addExecutionMode(function_main_,
                                spv::ExecutionModeSignedZeroInfNanPreserve, 32);
   }
-  if (features_.rounding_mode_rte_float32 &&
-      !cvars::spirv_disable_rounding_mode_rte) {
+  if (RoundsTowardZeroInHardware()) {
+    builder_->addCapability(spv::CapabilityRoundingModeRTZ);
+    builder_->addExecutionMode(function_main_,
+                               spv::ExecutionModeRoundingModeRTZ, 32);
+  } else if (features_.rounding_mode_rte_float32 &&
+             !cvars::spirv_disable_rounding_mode_rte) {
     builder_->addCapability(spv::CapabilityRoundingModeRTE);
     builder_->addExecutionMode(function_main_,
                                spv::ExecutionModeRoundingModeRTE, 32);
@@ -1388,10 +1395,6 @@ void SpirvShaderTranslator::PostTranslation() {
       shader_binding.min_filter = translator_binding.min_filter;
       shader_binding.mip_filter = translator_binding.mip_filter;
       shader_binding.aniso_filter = translator_binding.aniso_filter;
-      shader_binding.border_color_forced =
-          translator_binding.border_color_forced;
-      shader_binding.forced_border_color =
-          translator_binding.forced_border_color;
     }
     // Publish the bindings to draw-thread readers (GetGuestMesaSpirvShader)
     // after they are fully written, so a PS translated on a creation thread is

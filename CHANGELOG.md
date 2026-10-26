@@ -4,6 +4,14 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## Unreleased
 
+## 0.1.0.2 - 26 October 2026
+
+- Merge Xenia Edge `d881a29` in full: improve Xenos shader arithmetic/rounding, fixed-point blending, float16 formats, Vulkan depth bias and converted index-buffer sizing; update Mesa. These are upstream rendering/correctness changes, without a measured performance claim.
+- Integrate upstream guest-memory protection and page-table flush corrections, file rename/information and timer/APC fixes, XAM/NUI/user-service behavior, music playback cleanup/settings and raw-Ethernet System Link APIs. Multiplayer and physical Kinect support are not established by this merge.
+- Adapt the Libretro audio adapter to upstream's shared driver destruction, clear queued RetroPad keystrokes on title launch, and keep new assertion/disc-error paths headless. Frontend audio-block sizing, vblank pacing, Vulkan handoff and existing shutdown paths are preserved.
+- Use the bundled upstream Japanese font and include both embedded-font OFL licenses in release packages. Standalone UI, native Metal, tools and packaging remain excluded.
+- Continue remote release builds for all six configured targets, with mandatory desktop packages/Windows symbols and Android non-blocking until further user instruction. Runtime results from earlier releases retain their original attribution.
+
 - Verify and publish the complete six-target `v0.1.0.1` release through GitHub Actions, including both Android targets and matching Windows crash symbols. All eight downloaded assets pass checksum/source/provenance checks; the local macOS installation matches its CI archive. Other-platform frontend and gameplay acceptance remains pending.
 
 - Build and publish all six configured release targets through the shared remote build workflow: Windows x86_64, Linux x86_64/ARM64, macOS ARM64 and Android ARM64/x86_64. Require matching Windows symbols and the complete desktop set; Android remains non-blocking until further user instruction, so failed Android builds can be omitted while the verified desktop set is published.

@@ -171,7 +171,11 @@ def make_archive(directory, tag, target, files, manifest):
         payload = Path(work)
         for path in files:
             shutil.copy2(path, payload / path.name)
-        shutil.copy2('LICENSE', payload / 'LICENSE')
+        license_text = Path('LICENSE').read_text()
+        for font_license in sorted(Path('assets/font').glob('*OFL.txt')):
+            license_text += f'\n\nEmbedded Font License: {font_license.name}\n\n'
+            license_text += font_license.read_text()
+        (payload / 'LICENSE').write_text(license_text)
         manifest = dict(manifest, target=target, files={p.name: sha(p) for p in files})
         (payload / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         (payload / 'README.txt').write_text(
@@ -179,6 +183,7 @@ def make_archive(directory, tag, target, files, manifest):
             'Install the core and matching .info in the directories configured by RetroArch.\n'
             'The symbols archive is for crash diagnosis, not installation as a core.\n'
             'Games, firmware, RetroArch and MoltenVK are not included.\n'
+            'LICENSE includes the licenses of the embedded fonts.\n'
             'Build/API checks do not establish gameplay, audio or hardware compatibility.\n\n'
             f'Source: https://github.com/{os.environ["GITHUB_REPOSITORY"]}/releases/tag/{tag}\n'
             f'Built, packaged and published by: {manifest["ci_run_url"]}\n')
