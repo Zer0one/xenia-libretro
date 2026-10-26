@@ -65,7 +65,8 @@ def verify_archive(archive, tag, target, source_commit):
     return manifest
 
 
-def verify(directory, tag, source_commit, target=None, publication_status=None, assemble_checksums=False):
+def verify(directory, tag, source_commit, target=None, publication_status=None, assemble_checksums=False,
+           desktop_only=False):
     desktop = [t for t in TARGETS if not t.startswith('android-')]
     android = [t for t in TARGETS if t.startswith('android-')]
     selected = [target] if target else desktop
@@ -77,7 +78,10 @@ def verify(directory, tag, source_commit, target=None, publication_status=None, 
     manifests = {t: verify_archive(directory / archive_name(tag, t), tag, t, source_commit) for t in selected}
     omitted = False
     reason = ''
-    if not target:
+    if not target and desktop_only:
+        omitted = True
+        reason = 'Android intentionally excluded until further user instruction.'
+    elif not target:
         try:
             checked = {t: verify_archive(directory / archive_name(tag, t), tag, t, source_commit) for t in android}
         except (AssertionError, FileNotFoundError, zipfile.BadZipFile) as error:
@@ -104,6 +108,7 @@ def verify(directory, tag, source_commit, target=None, publication_status=None, 
         assert symbols['ci_run_attempt'] == core['ci_run_attempt']
     result = {'published_targets': [t for t in selected if not t.endswith('-symbols')],
               'android_omitted': omitted, 'android_omission_reason': reason,
+              'android_excluded': bool(desktop_only and not target),
               'commit': source_commit, 'ci_run_id': os.environ['GITHUB_RUN_ID']}
     if publication_status:
         publication_status.write_text(json.dumps(result, indent=2) + '\n')
@@ -233,6 +238,8 @@ if __name__ == '__main__':
     parser.add_argument('--source-commit')
     parser.add_argument('--publication-status', type=Path)
     parser.add_argument('--assemble-checksums', action='store_true')
+    parser.add_argument('--desktop-only', action='store_true',
+                        help='Require desktop packages and reject Android archives under the current release policy')
     args = parser.parse_args()
     assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+', args.tag)
     if args.action == 'build':
@@ -240,4 +247,5 @@ if __name__ == '__main__':
         build(args.core, args.output, args.tag, args.target, args.symbols)
     else:
         assert args.source_commit
-        verify(args.output, args.tag, args.source_commit, args.target, args.publication_status, args.assemble_checksums)
+        verify(args.output, args.tag, args.source_commit, args.target, args.publication_status,
+               args.assemble_checksums, args.desktop_only)

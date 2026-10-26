@@ -75,6 +75,25 @@ class PublicationGateTests(unittest.TestCase):
             self.verify()
         self.assertFalse((self.directory / 'SHA256SUMS').exists())
 
+    def test_desktop_only_policy_accepts_desktop_and_symbols_without_android(self):
+        for target in self.targets:
+            if not target.startswith('android-'):
+                self.archive(target)
+        status = self.directory.parent / (self.directory.name + '-status.json')
+        self.addCleanup(lambda: status.unlink(missing_ok=True))
+        with contextlib.redirect_stdout(io.StringIO()):
+            package.verify(self.directory, self.tag, self.commit, desktop_only=True,
+                           publication_status=status, assemble_checksums=True)
+        self.assertEqual(5, len((self.directory / 'SHA256SUMS').read_text().splitlines()))
+        self.assertTrue(json.loads(status.read_text())['android_excluded'])
+
+    def test_desktop_only_policy_rejects_unexpected_android_archives(self):
+        self.all_archives()
+        with self.assertRaises(AssertionError), contextlib.redirect_stdout(io.StringIO()):
+            package.verify(self.directory, self.tag, self.commit, desktop_only=True,
+                           assemble_checksums=True)
+        self.assertFalse((self.directory / 'SHA256SUMS').exists())
+
     def test_missing_android_blocks_without_permission(self):
         self.all_archives()
         (self.directory / package.archive_name(self.tag, 'android-x86_64')).unlink()

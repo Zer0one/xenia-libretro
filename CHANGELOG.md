@@ -4,6 +4,8 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## Unreleased
 
+- Exclude Android from future release compilation and publication until further user instruction. Release checks require exactly the four desktop packages plus matching Windows symbols and reject unexpected Android archives. Existing release artifacts are retained.
+
 ## 0.1.0.2 - 26 October 2026
 
 - Merge Xenia Edge `d881a29` in full: improve Xenos shader arithmetic/rounding, fixed-point blending, float16 formats, Vulkan depth bias and converted index-buffer sizing; update Mesa. These are upstream rendering/correctness changes, without a measured performance claim.

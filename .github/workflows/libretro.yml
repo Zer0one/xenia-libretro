@@ -50,7 +50,7 @@ env:
 # everything.
 jobs:
   linux:
-    if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'linux')
+    if: inputs.platforms == '' || inputs.platforms == 'all' || contains(inputs.platforms, 'linux')
     name: Linux ${{ matrix.arch }}
     timeout-minutes: 90
     runs-on: ${{ matrix.runner }}
@@ -144,7 +144,7 @@ jobs:
           retention-days: 14
 
   windows:
-    if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'windows')
+    if: inputs.platforms == '' || inputs.platforms == 'all' || contains(inputs.platforms, 'windows')
     name: Windows x86_64
     timeout-minutes: 90
     runs-on: windows-2025
@@ -251,7 +251,7 @@ jobs:
   # to RetroArch. Apple Silicon only: the x64 backend needs the address space
   # below 4 GB, which a dylib can't free (the __PAGEZERO is RetroArch's)
   macos:
-    if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'macos')
+    if: inputs.platforms == '' || inputs.platforms == 'all' || contains(inputs.platforms, 'macos')
     name: macOS ${{ matrix.arch }}
     timeout-minutes: 60
     runs-on: macos-15
@@ -353,7 +353,7 @@ jobs:
   # for the host first
   android:
     continue-on-error: ${{ github.event_name == 'push' || inputs.allow_android_failure }}
-    if: github.event_name != 'workflow_dispatch' || inputs.platforms == 'all' || contains(inputs.platforms, 'android')
+    if: inputs.platforms == '' || inputs.platforms == 'all' || contains(inputs.platforms, 'android')
     name: Android ${{ matrix.abi }}
     timeout-minutes: 90
     runs-on: ubuntu-24.04
