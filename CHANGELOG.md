@@ -4,9 +4,7 @@ What changed in the libretro core of this fork, newest first. Changes that come 
 
 ## Unreleased
 
-## 0.1.0.3 - 28 October 2026
-
-- Publish the Libretro baseline review and integration policy: WizzardSK f23c14c71 is already fully included; local audio, lifecycle, Vulkan and engine adapters are documented separately. The emulator source and engine revision d881a29 are unchanged from 0.1.0.2.
+- Document the Libretro baseline review and integration policy: WizzardSK f23c14c71 is already fully included; local audio, lifecycle, Vulkan and engine adapters are documented separately. The emulator source and engine revision d881a29 are unchanged from 0.1.0.2.
 - Exclude Android from future release compilation and publication until further user instruction. Release checks require exactly the four desktop packages plus matching Windows symbols and reject unexpected Android archives. Existing release artifacts are retained.
 
 ## 0.1.0.2 - 26 October 2026
