@@ -1,12 +1,13 @@
 # Roadmap
 
-Updated: 26 October 2026. Development belongs on this fork's `main`; `libretro` retains the WizzardSK port reference, and `upstream` tracks `has207/xenia-edge:edge`. Completed implementation and completed runtime validation are recorded separately.
+Updated: 28 October 2026. Development belongs on this fork's `main`; `libretro` retains the WizzardSK port reference, and `upstream` tracks `has207/xenia-edge:edge`. Completed implementation and completed runtime validation are recorded separately.
 
 🟢 Completed · 🟡 Partial · ⚪ Not Started · 🔵 Deferred
 
 | Status | Activity | Remaining Work |
 | --- | --- | --- |
 | 🟢 | Fork And Upstream References | Fork and separate source references are configured. Publication of the first rolling release is authorized; source history and the port reference remain separate. |
+| 🟢 | Libretro Baseline Comparison | Remote WizzardSK/xenia-libretro remains f23c14c71 and is already fully included: zero incoming port commits. Classified ten changed Libretro files separately from the approved engine advance from 8dc77b0 to d881a29. Core Options, translations, the general API header, core info and disc-control files match the donor. No new code merge, API migration or duplicate build is needed. Local adaptations and limits are recorded in `UPSTREAM_BASELINE_REVIEW.md`; future integration follows `UPSTREAM_INTEGRATION.md`. Upstream PR preparation and remaining runtime checks are separate. |
 | 🟢 | Initial macOS ARM64 Build And Boot | The original 8dc77b0-based core built and reached the Daytona USA title screen in an isolated RetroArch setup. This establishes boot only. |
 | 🟢 | Initial Performance Investigation | Same-revision Vulkan comparison identified frontend VSync/presentation waits as a leading cause of the observed slowdown. A driver mismatch also affected guest-memory import. These observations do not establish a production fix. |
 | 🟢 | Full Xenia Edge Source Integration | Full merge advanced from eb31a60 to d881a29, retaining Libretro hooks, frontend-driven vblank, audio block delivery and standalone exclusions. The audio adapter follows the updated upstream driver lifetime API; title launch resets queued RetroPad keystrokes. New revision build/package checks and publication are tracked separately from older runtime evidence. |
@@ -24,7 +25,7 @@ Updated: 26 October 2026. Development belongs on this fork's `main`; `libretro` 
 | 🔵 | Alternative Vulkan Provider: KosmicKrisp (Optional) | Deferred. Assess macOS support and RetroArch loader/device integration before considering a MoltenVK / KosmicKrisp core selector: the frontend creates and shares the Vulkan instance/device, so provider selection may require frontend changes. Keep MoltenVK as the default. If feasible, compare performance, frame pacing and stability with the same game, scene and settings, preserving all previous evidence. No implementation or tests are currently scheduled. |
 | 🔵 | Native Metal Backend (Optional) | Deferred. Reassess feasibility after upstream synchronization and Vulkan/MoltenVK validation. No implementation is currently scheduled. |
 
-Routine upstream integration preserves shared emulation logic and the existing Core Options contract. The current presentation work was authorized separately; additional frontend options and loader policies still need review. Disabling frontend VSync remains diagnostic only. The user explicitly authorized commit, push and release on 25 October 2026; this includes adapting the inherited build trigger to the fork's `main` branch.
+Routine integration starts from the upstream Libretro port and adapts this fork's improvements to it, normally following upstream API, structure, Core Options and format changes. Historical fork behavior alone is not a reason to keep a divergent format. Exceptions need a concrete problem or documented requirement; substantial choices and tradeoffs need user review. See `UPSTREAM_INTEGRATION.md`. The current presentation work was authorized separately; fork-specific frontend options and loader policies still need review. Disabling frontend VSync remains diagnostic only. The user explicitly authorized commit, push and release on 25 October 2026; this includes adapting the inherited build trigger to the fork's `main` branch.
 
 The independent-queue follow-up identifies two distinct mechanisms in MoltenVK:
 concurrent lazy drawable publication changes a texture within one submission,

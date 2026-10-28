@@ -2,7 +2,9 @@
 
 A [libretro](https://www.libretro.com/) core of [Xenia Edge](https://github.com/has207/xenia-edge), the Xbox 360 emulator, for RetroArch and other libretro frontends.
 
-The emulator is upstream's: this repository follows xenia-edge and adds the libretro frontend in `libretro/`. It holds the core only; upstream's standalone UI, packaging and CI are not part of it (the paths are listed in `.upstream-excluded`). The version the core reports is upstream's, with the upstream commit it is merged to (`upstream.version`). The current source integrates xenia-edge commit d881a29 (full merge through 26 October 2026). See [Roadmap](ROADMAP.md) for validation status and planned work.
+For port integrations, use [WizzardSK/xenia-libretro](https://github.com/WizzardSK/xenia-libretro) as the reference base and adapt this fork's improvements to its current Libretro APIs, structures and formats. Xenia Edge is the separate shared engine source. Follow normal upstream changes and keep only motivated, documented exceptions; see [Upstream Integration Policy](UPSTREAM_INTEGRATION.md).
+
+This repository holds the core only; the standalone's UI, packaging and CI are not part of it (the paths are listed in `.upstream-excluded`). The version the core reports is the engine revision it is merged to (`upstream.version`). The current source integrates xenia-edge commit d881a29 (full merge through 26 October 2026). The [Libretro Baseline Review](UPSTREAM_BASELINE_REVIEW.md) on that date confirms that the remote Libretro reference f23c14c71 is fully included; the port and engine revisions are tracked separately. See [Roadmap](ROADMAP.md) for validation status and planned work.
 
 ## Downloads
 
@@ -14,6 +16,8 @@ The [WizzardSK source port](https://github.com/WizzardSK/xenia-libretro) is buil
 - **Android:** `xenia_edge_libretro_android.so`.
 
 The release workflow now builds four desktop targets: Windows x86_64, Linux x86_64/ARM64 and macOS ARM64. Android compilation and publication are excluded from future releases until further user instruction; earlier releases may still contain Android packages. Each platform package includes the core, matching `.info`, provenance and checksums; Windows symbols are published separately. Install the two core files in RetroArch's configured core and information directories. Publication requires the complete desktop set and matching Windows symbols; unexpected Android archives block publication under the current policy. The release notes list the actual published targets. MoltenVK is not bundled in this package: original frontend drivers use the core's compatibility path.
+
+The current rolling release is [v0.1.0.3](https://github.com/Zer0one/xenia-libretro/releases/tag/v0.1.0.3). It publishes the Libretro baseline review and integration policy and applies desktop-only release packaging. Emulator behavior and the integrated engine revision `d881a29` are unchanged from `v0.1.0.2`.
 
 This fork uses rolling builds under the standard core filename. Local macOS updates install `xenia_edge_libretro.dylib` and its matching `xenia_edge_libretro.info`; each validated build replaces the previous installed build, with the previous copy retained in deployment backups.
 
